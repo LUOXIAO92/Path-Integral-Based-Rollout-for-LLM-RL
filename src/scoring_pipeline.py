@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 
-from src.candidates import build_candidate_from_judgement, failed_candidate_from_rollout
+from src.candidates import build_candidate_from_judgement, failed_candidate_from_rollout, rollout_has_required_logprobs
 from src.judging import judge_rollout
 from src.schemas import PathRecord, ProblemInput, RolloutRecord, ScoreConfig
 
@@ -29,6 +29,11 @@ async def build_candidate_for_rollout(
 ) -> tuple[PathRecord, list[dict]]:
     if not rollout.is_valid:
         return failed_candidate_from_rollout(rollout, rollout.error), []
+    if not rollout_has_required_logprobs(rollout):
+        return failed_candidate_from_rollout(
+            rollout,
+            "rollout_missing_raw_or_proposal_logprobs",
+        ), []
 
     evaluation, raw_rows, attempts, error = await judge_rollout(
         problem=problem,

@@ -172,6 +172,12 @@ class RolloutRecord(StrictModel):
     rollout_index: int
     path_text: str = ""
     token_logprobs: list[float] = []
+    raw_token_logprobs: list[float] = []
+    proposal_token_logprobs: list[float] = []
+    raw_logprob_sum: float | None = None
+    proposal_logprob_sum: float | None = None
+    proposal_distribution: str = ""
+    raw_logprob_source: str = ""
     is_valid: bool = False
     error: str | None = None
 
@@ -181,8 +187,10 @@ class RolloutConfig(StrictModel):
     dataset: str
     student_model: str
     student_base_url: str
+    backend: str = "openai"
     temperature: float
     top_p: float
+    top_k: int | None = None
     max_tokens: int
     extra_body: dict | None = None
     rollout_budget: int

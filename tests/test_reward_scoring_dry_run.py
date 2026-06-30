@@ -33,6 +33,12 @@ def test_reward_scoring_dry_run_writes_candidates_and_raw_rewards(tmp_path, monk
         rollout_index=0,
         path_text=ANSWER,
         token_logprobs=[-0.1, -0.2, -0.3],
+        raw_token_logprobs=[-0.1, -0.2, -0.3],
+        proposal_token_logprobs=[-0.05, -0.15, -0.25],
+        raw_logprob_sum=-0.6000000000000001,
+        proposal_logprob_sum=-0.45,
+        proposal_distribution="vllm_processed",
+        raw_logprob_source="vllm_prefill",
         is_valid=True,
     )
     rollouts_path.write_text(rollout.model_dump_json() + "\n", encoding="utf-8")

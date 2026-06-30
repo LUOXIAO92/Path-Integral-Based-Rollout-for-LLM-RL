@@ -24,6 +24,14 @@ conda run -n rl-rollout python scripts/run_openai_rollout.py
 
 This writes `outputs/openai_rollout/rollouts.jsonl`. Stop here when you only want to test the student model. This command does not call the reward or teacher model.
 
+Generate local vLLM-compatible rollouts with raw/proposal logprobs:
+
+```bash
+conda run -n rl-rollout python scripts/run_vllm_rollout.py
+```
+
+The default backend is `mock` for local development. Use the vLLM backend on a Linux/GPU machine with vLLM installed when true proposal logprobs are required.
+
 Score rollouts with the reward or teacher model:
 
 ```bash

@@ -5,6 +5,10 @@ from src.schemas import PathRecord, RewardEvaluation, RolloutRecord, ScoreConfig
 from src.scoring import score_reward_evaluation
 
 
+def rollout_has_required_logprobs(rollout: RolloutRecord) -> bool:
+    return bool(rollout.raw_token_logprobs and rollout.proposal_token_logprobs)
+
+
 def failed_candidate_from_rollout(
     rollout: RolloutRecord,
     error: str | None,
@@ -34,9 +38,11 @@ def build_candidate_from_judgement(
     length_scale: float,
     reward_attempts: int,
 ) -> PathRecord:
+    if not rollout_has_required_logprobs(rollout):
+        raise ValueError("rollout is missing raw or proposal token logprobs")
     scored = score_reward_evaluation(evaluation, score_config)
     metrics = compute_path_metrics(
-        token_logprobs=rollout.token_logprobs,
+        token_logprobs=rollout.raw_token_logprobs,
         g=scored.g,
         eta=eta,
         lambda_g=lambda_g,
