@@ -23,6 +23,7 @@ from src.schemas import DatasetPrepManifest, ProblemInput
 
 
 # Dataset repos.
+MATH500_REPO = "HuggingFaceH4/MATH-500"
 COMPETITION_MATH_REPO = "qwedsacf/competition_math"
 OLYMPIADBENCH_REPO = "Hothan/OlympiadBench"
 LIVECODEBENCH_REPO = "livecodebench/code_generation_lite"
@@ -31,15 +32,15 @@ NORMALIZED_DATA_JSONL = REPO_ROOT / "data" / "problems.jsonl"
 NORMALIZED_DATA_MANIFEST = REPO_ROOT / "data" / "problems_manifest.json"
 
 # Row limits. Use None for all rows.
-MAX_COMPETITION_MATH = None
-MAX_OLYMPIADBENCH = None
-MAX_LIVECODEBENCH = None
+MAX_COMPETITION_MATH = 100
+MAX_OLYMPIADBENCH = 400
+MAX_LIVECODEBENCH = 200
 
 OLYMPIADBENCH_CONFIGS = OLYMPIADBENCH_TEXT_CONFIGS
 LIVECODEBENCH_FILES = LIVE_CODE_BENCH_RELEASE_LATEST_FILES
 
 SHUFFLE = False
-RANDOM_SEED = 1234
+RANDOM_SEED = 4021
 
 
 def main() -> None:

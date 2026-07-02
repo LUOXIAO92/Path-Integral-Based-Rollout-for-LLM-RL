@@ -9,7 +9,13 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
-from src.io_utils import read_jsonl, read_model_jsonl, write_json, write_jsonl
+from src.io_utils import (
+    hydrate_rollout_logprobs,
+    read_jsonl,
+    read_model_jsonl,
+    write_json,
+    write_jsonl,
+)
 from src.openai_client import make_async_client
 from src.rewarding import load_reward_prompt, reward_response_format
 from src.schemas import RolloutRecord, ScoreConfig, ScoringConfig
@@ -46,7 +52,10 @@ async def main() -> None:
     run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
     problems = read_jsonl(INPUT_JSONL)
     problems_by_id = {problem.problem_id: problem for problem in problems}
-    rollouts = read_model_jsonl(ROLLOUTS_JSONL, RolloutRecord)
+    rollouts = hydrate_rollout_logprobs(
+        read_model_jsonl(ROLLOUTS_JSONL, RolloutRecord),
+        ROLLOUTS_JSONL.parent,
+    )
     template = load_reward_prompt(REWARD_PROMPT_PATH)
     client = make_async_client(REWARD_API_KEY, REWARD_BASE_URL)
     semaphore = asyncio.Semaphore(REWARD_CONCURRENCY)

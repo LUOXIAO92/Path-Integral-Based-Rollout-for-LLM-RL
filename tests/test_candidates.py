@@ -15,8 +15,11 @@ def rollout_record() -> RolloutRecord:
         token_logprobs=[-0.1, -0.2],
         raw_token_logprobs=[-0.1, -0.2],
         proposal_token_logprobs=[-0.05, -0.15],
+        output_token_count=2,
         raw_logprob_sum=-0.30000000000000004,
         proposal_logprob_sum=-0.2,
+        raw_logprob_mean=-0.15000000000000002,
+        proposal_logprob_mean=-0.1,
         proposal_distribution="vllm_processed",
         raw_logprob_source="vllm_prefill",
         is_valid=True,
@@ -40,8 +43,9 @@ def test_build_candidate_from_judgement_computes_scores_and_metrics() -> None:
     assert candidate.reward_valid is True
     assert candidate.reward_attempts == 2
     assert candidate.g == 1.0
-    assert candidate.s0 == 0.30000000000000004
-    assert candidate.s_eta == -0.7
+    assert candidate.output_token_count == 2
+    assert candidate.s0 == 0.15000000000000002
+    assert candidate.s_eta == -0.85
     assert candidate.final_correctness is True
 
 

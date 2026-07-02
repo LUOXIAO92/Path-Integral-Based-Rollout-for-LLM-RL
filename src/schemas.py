@@ -174,8 +174,13 @@ class RolloutRecord(StrictModel):
     token_logprobs: list[float] = []
     raw_token_logprobs: list[float] = []
     proposal_token_logprobs: list[float] = []
+    output_token_count: int = 0
     raw_logprob_sum: float | None = None
     proposal_logprob_sum: float | None = None
+    raw_logprob_mean: float | None = None
+    proposal_logprob_mean: float | None = None
+    logprob_file: str = ""
+    logprob_dtype: str = ""
     proposal_distribution: str = ""
     raw_logprob_source: str = ""
     is_valid: bool = False
@@ -219,6 +224,7 @@ class PathRecord(StrictModel):
     chain_step: int | None = None
     source_path_id: str | None = None
     path_text: str = ""
+    output_token_count: int | None = None
     is_accepted: bool | None = None
     g: float | None = Field(default=None, validation_alias="G[τ]", serialization_alias="G[τ]")
     n: float | None = Field(default=None, validation_alias="N[τ]", serialization_alias="N[τ]")

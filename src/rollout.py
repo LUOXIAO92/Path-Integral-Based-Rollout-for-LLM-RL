@@ -99,6 +99,7 @@ async def generate_rollout_record(
             error="student response did not include token logprobs",
         )
 
+    output_token_count = len(generation.token_logprobs)
     return RolloutRecord(
         run_id=run_id,
         problem_id=problem.problem_id,
@@ -106,5 +107,6 @@ async def generate_rollout_record(
         rollout_index=rollout_index,
         path_text=generation.path_text,
         token_logprobs=generation.token_logprobs,
+        output_token_count=output_token_count,
         is_valid=True,
     )

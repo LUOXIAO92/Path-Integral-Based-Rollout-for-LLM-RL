@@ -57,6 +57,7 @@ def build_candidate_from_judgement(
         method="mcmc_candidate",
         path_id=rollout.path_id,
         path_text=rollout.path_text,
+        output_token_count=rollout.output_token_count or len(rollout.raw_token_logprobs),
         g=scored.g,
         n=metrics.n,
         k=metrics.k,

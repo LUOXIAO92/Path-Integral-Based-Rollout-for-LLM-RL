@@ -45,6 +45,7 @@ def test_generate_rollout_record_writes_valid_rollout(monkeypatch) -> None:
     assert record.path_id == "p1-0002"
     assert record.path_text == ANSWER
     assert record.token_logprobs == [-0.1, -0.2]
+    assert record.output_token_count == 2
     assert record.is_valid is True
     assert record.error is None
 

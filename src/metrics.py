@@ -21,8 +21,11 @@ def compute_path_metrics(
     length_max: int,
     length_scale: float,
 ) -> PathMetrics:
-    s0 = -sum(token_logprobs)
-    n = compute_length_penalty(len(token_logprobs), length_max, length_scale)
+    output_token_count = len(token_logprobs)
+    if output_token_count == 0:
+        raise ValueError("token_logprobs must not be empty")
+    s0 = -sum(token_logprobs) / output_token_count
+    n = compute_length_penalty(output_token_count, length_max, length_scale)
     k = 0.0
     f = lambda_g * g - lambda_n * n - lambda_kl * k
     s_eta = s0 - eta * f
