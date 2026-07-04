@@ -3,40 +3,60 @@ from __future__ import annotations
 import math
 import random
 from collections import defaultdict
+from dataclasses import dataclass
+from typing import Literal
 
 from src.schemas import PathRecord
+
+ProposalRatioMode = Literal["normalized", "strict"]
+
+
+@dataclass(frozen=True)
+class StrictMCMCActionConfig:
+    eta: float
+    lambda_g: float
+    lambda_n: float
+    lambda_kl: float
+    length_max: int
+    length_scale: float
+    strict_length_alpha: float
 
 
 def metropolis_acceptance_probability(
     current_s_eta: float,
     candidate_s_eta: float,
-    rho_prop: float,
+    proposal_log_ratio: float,
 ) -> float:
-    if not 0 < rho_prop <= 1:
-        raise ValueError("rho_prop must be in (0, 1]")
     delta_s_eta = candidate_s_eta - current_s_eta
-    try:
-        value = rho_prop * math.exp(-delta_s_eta)
-    except OverflowError:
-        value = float("inf")
-    return min(1.0, value)
+    log_accept = -delta_s_eta + proposal_log_ratio
+    if log_accept >= 0:
+        return 1.0
+    if log_accept < -745:
+        return 0.0
+    return math.exp(log_accept)
 
 
 def metropolis_accept(
     current_s_eta: float,
     candidate_s_eta: float,
-    rho_prop: float,
+    proposal_log_ratio: float,
     rng: random.Random,
 ) -> tuple[bool, float]:
-    prob = metropolis_acceptance_probability(current_s_eta, candidate_s_eta, rho_prop)
+    prob = metropolis_acceptance_probability(current_s_eta, candidate_s_eta, proposal_log_ratio)
     return rng.random() <= prob, prob
 
 
 def run_mcmc_chain(
     candidates: list[PathRecord],
-    rho_prop: float,
+    proposal_ratio_mode: ProposalRatioMode,
     rng: random.Random,
+    strict_action_config: StrictMCMCActionConfig | None = None,
 ) -> tuple[list[PathRecord], list[PathRecord]]:
+    if proposal_ratio_mode not in ("normalized", "strict"):
+        raise ValueError("proposal_ratio_mode must be 'normalized' or 'strict'")
+    if proposal_ratio_mode == "strict" and strict_action_config is None:
+        raise ValueError("strict_action_config is required for strict proposal ratio mode")
+
     grouped: dict[str, list[PathRecord]] = defaultdict(list)
     for record in candidates:
         grouped[record.problem_id].append(record)
@@ -47,6 +67,7 @@ def run_mcmc_chain(
         current: PathRecord | None = None
         chain_step = 0
         for record in grouped[problem_id]:
+            transition_update: dict[str, float | str] | None = None
             if not record.reward_valid or record.s_eta is None:
                 updated_candidates.append(record)
                 continue
@@ -55,25 +76,162 @@ def run_mcmc_chain(
                 candidate = record.model_copy(update={"is_accepted": True, "acceptance_prob": 1.0})
                 current = candidate
             else:
-                accepted, prob = metropolis_accept(current.s_eta, record.s_eta, rho_prop, rng)
-                candidate = record.model_copy(update={"is_accepted": accepted, "acceptance_prob": prob})
+                proposal = compute_proposal_transition(current, record, proposal_ratio_mode)
+                action = compute_transition_action(
+                    current,
+                    record,
+                    proposal_ratio_mode,
+                    strict_action_config,
+                )
+                accepted, prob = metropolis_accept(
+                    action["selected_s_eta_current"],
+                    action["selected_s_eta_candidate"],
+                    proposal["proposal_log_ratio"],
+                    rng,
+                )
+                transition_update = {**proposal, **action, "acceptance_prob": prob}
+                candidate = record.model_copy(
+                    update={
+                        **transition_update,
+                        "is_accepted": accepted,
+                    }
+                )
                 if accepted:
                     current = candidate
 
             updated_candidates.append(candidate)
+            chain_update = {
+                "method": "mcmc_chain_state",
+                "chain_step": chain_step,
+                "source_path_id": current.path_id,
+                "is_accepted": True,
+            }
+            if transition_update is not None:
+                chain_update.update(transition_update)
             chain_records.append(
-                current.model_copy(
-                    update={
-                        "method": "mcmc_chain_state",
-                        "chain_step": chain_step,
-                        "source_path_id": current.path_id,
-                        "is_accepted": True,
-                    }
-                )
+                current.model_copy(update=chain_update)
             )
             chain_step += 1
 
     return updated_candidates, chain_records
+
+
+def compute_transition_action(
+    current: PathRecord,
+    candidate: PathRecord,
+    proposal_ratio_mode: ProposalRatioMode,
+    strict_action_config: StrictMCMCActionConfig | None,
+) -> dict[str, float]:
+    if proposal_ratio_mode == "strict":
+        if strict_action_config is None:
+            raise ValueError("strict_action_config is required for strict proposal ratio mode")
+        current_action = compute_strict_action(current, strict_action_config)
+        candidate_action = compute_strict_action(candidate, strict_action_config)
+        return {
+            "strict_length_alpha": strict_action_config.strict_length_alpha,
+            "strict_length_penalty_scaled": candidate_action["strict_length_penalty_scaled"],
+            "strict_f": candidate_action["strict_f"],
+            "strict_s_eta": candidate_action["strict_s_eta"],
+            "selected_s_eta_current": current_action["strict_s_eta"],
+            "selected_s_eta_candidate": candidate_action["strict_s_eta"],
+        }
+    return {
+        "selected_s_eta_current": require_path_value(current.s_eta, current.path_id, "Sη[τ]"),
+        "selected_s_eta_candidate": require_path_value(candidate.s_eta, candidate.path_id, "Sη[τ]"),
+    }
+
+
+def compute_strict_action(
+    record: PathRecord,
+    config: StrictMCMCActionConfig,
+) -> dict[str, float]:
+    length = require_output_token_count(record.output_token_count, record.path_id)
+    n_scaled = compute_strict_length_penalty(
+        length=length,
+        length_max=config.length_max,
+        length_scale=config.length_scale,
+        strict_length_alpha=config.strict_length_alpha,
+    )
+    g = require_path_value(record.g, record.path_id, "G[τ]")
+    k = require_path_value(record.k, record.path_id, "K[τ]")
+    s0 = require_path_value(record.s0, record.path_id, "S0[τ]")
+    strict_f = config.lambda_g * g - config.lambda_n * n_scaled - config.lambda_kl * k
+    strict_s_eta = s0 - config.eta * strict_f
+    return {
+        "strict_length_penalty_scaled": n_scaled,
+        "strict_f": strict_f,
+        "strict_s_eta": strict_s_eta,
+    }
+
+
+def compute_strict_length_penalty(
+    length: int,
+    length_max: int,
+    length_scale: float,
+    strict_length_alpha: float,
+) -> float:
+    if length_scale <= 0:
+        raise ValueError("length_scale must be positive")
+    if not 0.0 <= strict_length_alpha <= 1.0:
+        raise ValueError("strict_length_alpha must be in [0, 1]")
+    return length * strict_length_alpha * math.tanh(max(0, length - length_max) / length_scale)
+
+
+def compute_proposal_transition(
+    current: PathRecord,
+    candidate: PathRecord,
+    proposal_ratio_mode: ProposalRatioMode,
+) -> dict[str, float | str]:
+    strict_forward = require_proposal_logprob(candidate.proposal_logprob_sum, candidate.path_id, "sum")
+    strict_reverse = require_proposal_logprob(current.proposal_logprob_sum, current.path_id, "sum")
+    normalized_forward = require_proposal_logprob(
+        candidate.proposal_logprob_mean,
+        candidate.path_id,
+        "mean",
+    )
+    normalized_reverse = require_proposal_logprob(
+        current.proposal_logprob_mean,
+        current.path_id,
+        "mean",
+    )
+    strict_ratio = strict_reverse - strict_forward
+    normalized_ratio = normalized_reverse - normalized_forward
+    if proposal_ratio_mode == "strict":
+        forward = strict_forward
+        reverse = strict_reverse
+        selected_ratio = strict_ratio
+    else:
+        forward = normalized_forward
+        reverse = normalized_reverse
+        selected_ratio = normalized_ratio
+    return {
+        "proposal_ratio_mode": proposal_ratio_mode,
+        "proposal_log_q_forward": forward,
+        "proposal_log_q_reverse": reverse,
+        "proposal_log_ratio": selected_ratio,
+        "proposal_log_ratio_strict": strict_ratio,
+        "proposal_log_ratio_normalized": normalized_ratio,
+    }
+
+
+def require_proposal_logprob(value: float | None, path_id: str, scale: str) -> float:
+    if value is None:
+        raise ValueError(f"{path_id} is missing proposal_logprob_{scale}")
+    return value
+
+
+def require_path_value(value: float | None, path_id: str, name: str) -> float:
+    if value is None:
+        raise ValueError(f"{path_id} is missing {name}")
+    return value
+
+
+def require_output_token_count(value: int | None, path_id: str) -> int:
+    if value is None:
+        raise ValueError(f"{path_id} is missing output_token_count")
+    if value <= 0:
+        raise ValueError(f"{path_id} output_token_count must be positive")
+    return value
 
 
 def select_best_of_n(candidates: list[PathRecord]) -> list[PathRecord]:

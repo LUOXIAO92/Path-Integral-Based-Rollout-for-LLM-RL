@@ -160,11 +160,6 @@ class ScoreConfig(StrictModel):
     no_scored_span_process_score: float = 0.0
 
 
-class StudentGeneration(StrictModel):
-    path_text: str
-    token_logprobs: list[float]
-
-
 class RolloutRecord(StrictModel):
     run_id: str
     problem_id: str
@@ -225,6 +220,21 @@ class PathRecord(StrictModel):
     source_path_id: str | None = None
     path_text: str = ""
     output_token_count: int | None = None
+    proposal_logprob_sum: float | None = None
+    proposal_logprob_mean: float | None = None
+    proposal_distribution: str = ""
+    proposal_ratio_mode: Literal["normalized", "strict"] | None = None
+    proposal_log_q_forward: float | None = None
+    proposal_log_q_reverse: float | None = None
+    proposal_log_ratio: float | None = None
+    proposal_log_ratio_strict: float | None = None
+    proposal_log_ratio_normalized: float | None = None
+    strict_length_alpha: float | None = None
+    strict_length_penalty_scaled: float | None = None
+    strict_f: float | None = None
+    strict_s_eta: float | None = None
+    selected_s_eta_current: float | None = None
+    selected_s_eta_candidate: float | None = None
     is_accepted: bool | None = None
     g: float | None = Field(default=None, validation_alias="G[τ]", serialization_alias="G[τ]")
     n: float | None = Field(default=None, validation_alias="N[τ]", serialization_alias="N[τ]")
@@ -260,7 +270,9 @@ class ScoringConfig(StrictModel):
 
 
 class MCMCConfig(StrictModel):
-    rho_prop: float
+    proposal_ratio_mode: Literal["normalized", "strict"]
+    strict_length_alpha: float
+    scoring_config_json: str | None = None
     random_seed: int
     candidates_jsonl: str
     output_dir: str

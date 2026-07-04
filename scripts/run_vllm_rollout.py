@@ -28,7 +28,7 @@ STUDENT_GPU_MEMORY_UTILIZATION = 0.85
 STUDENT_BATCH_SIZE = 30
 
 INPUT_JSONL = REPO_ROOT / "data" / "problems.jsonl"
-OUTPUT_DIR = REPO_ROOT / "outputs" / "openai_rollout"
+OUTPUT_DIR = REPO_ROOT / "outputs" / "vllm_rollout"
 DATASET_NAME = "prepared_problems_jsonl"
 ROLLOUT_BUDGET = 10
 

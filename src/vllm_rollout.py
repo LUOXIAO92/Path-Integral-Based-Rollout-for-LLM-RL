@@ -6,7 +6,7 @@ from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from src.rollout import student_messages
+from src.prompts import student_messages
 from src.schemas import ProblemInput, RolloutRecord
 
 try:

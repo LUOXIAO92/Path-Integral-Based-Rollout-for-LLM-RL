@@ -33,8 +33,8 @@ USE_REWARD_JSON_SCHEMA = True
 REWARD_EXTRA_BODY = None
 
 INPUT_JSONL = REPO_ROOT / "data" / "problems.jsonl"
-ROLLOUTS_JSONL = REPO_ROOT / "outputs" / "openai_rollout" / "rollouts.jsonl"
-OUTPUT_DIR = REPO_ROOT / "outputs" / "openai_rollout"
+ROLLOUTS_JSONL = REPO_ROOT / "outputs" / "vllm_rollout" / "rollouts.jsonl"
+OUTPUT_DIR = REPO_ROOT / "outputs" / "vllm_rollout"
 REWARD_PROMPT_PATH = REPO_ROOT / "docs" / "Reward_prompt.md"
 DATASET_NAME = "prepared_problems_jsonl"
 

@@ -44,9 +44,31 @@ def test_build_candidate_from_judgement_computes_scores_and_metrics() -> None:
     assert candidate.reward_attempts == 2
     assert candidate.g == 1.0
     assert candidate.output_token_count == 2
+    assert candidate.proposal_logprob_sum == -0.2
+    assert candidate.proposal_logprob_mean == -0.1
+    assert candidate.proposal_distribution == "vllm_processed"
     assert candidate.s0 == 0.15000000000000002
     assert candidate.s_eta == -0.85
     assert candidate.final_correctness is True
+
+
+def test_build_candidate_from_judgement_preserves_proposal_metadata() -> None:
+    candidate = build_candidate_from_judgement(
+        rollout=rollout_record(),
+        evaluation=RewardEvaluation.model_validate(valid_reward_payload()),
+        score_config=ScoreConfig(),
+        eta=1.0,
+        lambda_g=1.0,
+        lambda_n=1.0,
+        lambda_kl=0.0,
+        length_max=10,
+        length_scale=2.0,
+        reward_attempts=1,
+    )
+
+    assert candidate.proposal_logprob_sum == -0.2
+    assert candidate.proposal_logprob_mean == -0.1
+    assert candidate.proposal_distribution == "vllm_processed"
 
 
 def test_build_candidate_from_judgement_rejects_missing_dual_logprobs() -> None:

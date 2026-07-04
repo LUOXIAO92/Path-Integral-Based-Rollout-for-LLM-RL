@@ -142,6 +142,12 @@ def hydrate_rollout_logprobs(
                         "proposal_token_logprobs": proposal_logprobs,
                         "output_token_count": row.output_token_count
                         or output_token_count,
+                        "raw_logprob_sum": row.raw_logprob_sum
+                        if row.raw_logprob_sum is not None
+                        else raw_logprob_sum,
+                        "proposal_logprob_sum": row.proposal_logprob_sum
+                        if row.proposal_logprob_sum is not None
+                        else proposal_logprob_sum,
                         "raw_logprob_mean": row.raw_logprob_mean
                         if row.raw_logprob_mean is not None
                         else raw_logprob_sum / output_token_count,

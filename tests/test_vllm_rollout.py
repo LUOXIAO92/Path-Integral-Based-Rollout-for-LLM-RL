@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 from src.io_utils import hydrate_rollout_logprobs, read_model_jsonl
+from src.prompts import student_messages
 from src.schemas import ProblemInput, RolloutRecord
 from src.vllm_rollout import (
     GeneratedRollout,
@@ -22,6 +23,16 @@ from src.vllm_rollout import (
     valid_vllm_record,
 )
 from tests.test_helpers import PROBLEM
+
+
+def test_student_messages_use_prompt_template() -> None:
+    problem = ProblemInput(problem_id="p1", subject="math", problem=PROBLEM)
+    messages = student_messages(problem, "system", "Question: {problem}")
+
+    assert messages == [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": f"Question: {PROBLEM}"},
+    ]
 
 
 def test_mock_backend_writes_dual_logprobs() -> None:
@@ -472,10 +483,19 @@ def test_run_vllm_rollout_script_mock_backend(tmp_path, monkeypatch) -> None:
         np.testing.assert_allclose(raw_npz[path_id], [-0.30, -0.20, -0.10])
         np.testing.assert_allclose(proposal_npz[path_id], [-0.25, -0.15, -0.05])
 
-    rollout = read_model_jsonl(output_dir / "rollouts.jsonl", RolloutRecord)[0]
+    rollout = read_model_jsonl(output_dir / "rollouts.jsonl", RolloutRecord)[0].model_copy(
+        update={
+            "raw_logprob_sum": None,
+            "proposal_logprob_sum": None,
+            "raw_logprob_mean": None,
+            "proposal_logprob_mean": None,
+        }
+    )
     assert rollout.raw_token_logprobs == []
     hydrated = hydrate_rollout_logprobs([rollout], output_dir)
     assert hydrated[0].output_token_count == 3
+    assert hydrated[0].raw_logprob_sum == pytest.approx(-0.60)
+    assert hydrated[0].proposal_logprob_sum == pytest.approx(-0.45)
     assert hydrated[0].raw_logprob_mean == pytest.approx(-0.20)
     assert hydrated[0].proposal_logprob_mean == pytest.approx(-0.15)
     assert hydrated[0].raw_token_logprobs == pytest.approx([-0.30, -0.20, -0.10])
