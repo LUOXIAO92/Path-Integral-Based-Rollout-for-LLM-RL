@@ -4,14 +4,13 @@ import math
 import random
 
 from src.mcmc import (
-    StrictMCMCActionConfig,
     compute_strict_length_penalty,
     metropolis_accept,
     metropolis_acceptance_probability,
     run_mcmc_chain,
     select_best_of_n,
 )
-from src.schemas import PathRecord
+from src.schemas import PathRecord, ScoreConfig, ScoringConfig
 
 
 def test_metropolis_acceptance_probability_uses_action_difference() -> None:
@@ -122,7 +121,7 @@ def test_run_mcmc_chain_uses_strict_proposal_ratio() -> None:
         ),
     ]
 
-    updated, chain = run_mcmc_chain(candidates, "strict", random.Random(0), strict_config())
+    updated, chain = run_mcmc_chain(candidates, "strict", random.Random(0), scoring_config())
 
     assert updated[1].proposal_log_ratio == 2.0
     assert updated[1].proposal_log_q_forward == -12.0
@@ -131,7 +130,7 @@ def test_run_mcmc_chain_uses_strict_proposal_ratio() -> None:
     assert chain[1].proposal_log_ratio == 2.0
 
 
-def test_strict_mode_requires_strict_action_config() -> None:
+def test_strict_mode_requires_scoring_config() -> None:
     candidates = [
         record("p1", "a", s_eta=0.0, g=0.5),
         record("p1", "b", s_eta=0.0, g=0.5),
@@ -140,9 +139,23 @@ def test_strict_mode_requires_strict_action_config() -> None:
     try:
         run_mcmc_chain(candidates, "strict", random.Random(0))
     except ValueError as exc:
-        assert "strict_action_config" in str(exc)
+        assert "scoring_config" in str(exc)
     else:
-        raise AssertionError("strict mode should require strict action config")
+        raise AssertionError("strict mode should require scoring config")
+
+
+def test_strict_mode_requires_strict_length_alpha_in_scoring_config() -> None:
+    candidates = [
+        record("p1", "a", s_eta=0.0, g=0.5),
+        record("p1", "b", s_eta=0.0, g=0.5),
+    ]
+
+    try:
+        run_mcmc_chain(candidates, "strict", random.Random(0), scoring_config(None))
+    except ValueError as exc:
+        assert "strict_length_alpha" in str(exc)
+    else:
+        raise AssertionError("strict mode should require strict_length_alpha")
 
 
 def test_strict_mode_uses_strict_scaled_length_action() -> None:
@@ -168,7 +181,7 @@ def test_strict_mode_uses_strict_scaled_length_action() -> None:
         ),
     ]
 
-    updated, chain = run_mcmc_chain(candidates, "strict", random.Random(0), strict_config())
+    updated, chain = run_mcmc_chain(candidates, "strict", random.Random(0), scoring_config())
 
     expected_penalty = 20 * math.tanh(1.0)
     expected_candidate_action = expected_penalty
@@ -183,13 +196,13 @@ def test_strict_mode_uses_strict_scaled_length_action() -> None:
     assert chain[1].source_path_id == "short"
 
 
-def test_normalized_mode_ignores_strict_action_config() -> None:
+def test_normalized_mode_ignores_scoring_config() -> None:
     candidates = [
         record("p1", "a", s_eta=0.0, g=0.5, output_token_count=10),
         record("p1", "b", s_eta=-1.0, g=0.5, output_token_count=100),
     ]
 
-    updated, _ = run_mcmc_chain(candidates, "normalized", random.Random(0), strict_config())
+    updated, _ = run_mcmc_chain(candidates, "normalized", random.Random(0), scoring_config())
 
     assert updated[1].selected_s_eta_current == 0.0
     assert updated[1].selected_s_eta_candidate == -1.0
@@ -242,13 +255,19 @@ def record(
     )
 
 
-def strict_config() -> StrictMCMCActionConfig:
-    return StrictMCMCActionConfig(
+def scoring_config(strict_length_alpha: float | None = 1.0) -> ScoringConfig:
+    return ScoringConfig(
+        run_id="run",
+        dataset="test",
+        reward_model="reward",
+        reward_base_url="",
+        prompt_template_id="prompt",
         eta=1.0,
-        lambda_g=1.0,
-        lambda_n=1.0,
-        lambda_kl=0.0,
+        lambda_G=1.0,
+        lambda_N=1.0,
+        lambda_KL=0.0,
         length_max=10,
         length_scale=10.0,
-        strict_length_alpha=1.0,
+        strict_length_alpha=strict_length_alpha,
+        score_config=ScoreConfig(),
     )

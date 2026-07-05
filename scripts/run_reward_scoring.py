@@ -74,6 +74,7 @@ async def main() -> None:
         lambda_KL=LAMBDA_KL,
         length_max=LENGTH_MAX,
         length_scale=LENGTH_SCALE,
+        strict_length_alpha=None,
         score_config=SCORE_CONFIG,
     )
 

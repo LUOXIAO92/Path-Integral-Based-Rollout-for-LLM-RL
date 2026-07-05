@@ -86,3 +86,4 @@ def test_reward_scoring_dry_run_writes_candidates_and_raw_rewards(tmp_path, monk
 
     config = json.loads((output_dir / "scoring_config.json").read_text(encoding="utf-8"))
     assert config["extra_body"] is None
+    assert config["strict_length_alpha"] is None

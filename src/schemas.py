@@ -266,12 +266,12 @@ class ScoringConfig(StrictModel):
     lambda_KL: float
     length_max: int
     length_scale: float
+    strict_length_alpha: float | None = None
     score_config: ScoreConfig
 
 
 class MCMCConfig(StrictModel):
     proposal_ratio_mode: Literal["normalized", "strict"]
-    strict_length_alpha: float
     scoring_config_json: str | None = None
     random_seed: int
     candidates_jsonl: str

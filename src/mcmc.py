@@ -3,23 +3,11 @@ from __future__ import annotations
 import math
 import random
 from collections import defaultdict
-from dataclasses import dataclass
 from typing import Literal
 
-from src.schemas import PathRecord
+from src.schemas import PathRecord, ScoringConfig
 
 ProposalRatioMode = Literal["normalized", "strict"]
-
-
-@dataclass(frozen=True)
-class StrictMCMCActionConfig:
-    eta: float
-    lambda_g: float
-    lambda_n: float
-    lambda_kl: float
-    length_max: int
-    length_scale: float
-    strict_length_alpha: float
 
 
 def metropolis_acceptance_probability(
@@ -50,12 +38,20 @@ def run_mcmc_chain(
     candidates: list[PathRecord],
     proposal_ratio_mode: ProposalRatioMode,
     rng: random.Random,
-    strict_action_config: StrictMCMCActionConfig | None = None,
+    scoring_config: ScoringConfig | None = None,
 ) -> tuple[list[PathRecord], list[PathRecord]]:
     if proposal_ratio_mode not in ("normalized", "strict"):
         raise ValueError("proposal_ratio_mode must be 'normalized' or 'strict'")
-    if proposal_ratio_mode == "strict" and strict_action_config is None:
-        raise ValueError("strict_action_config is required for strict proposal ratio mode")
+    if proposal_ratio_mode == "strict" and scoring_config is None:
+        raise ValueError("scoring_config is required for strict proposal ratio mode")
+    if (
+        proposal_ratio_mode == "strict"
+        and scoring_config is not None
+        and scoring_config.strict_length_alpha is None
+    ):
+        raise ValueError(
+            "strict_length_alpha is required in scoring_config for strict proposal ratio mode"
+        )
 
     grouped: dict[str, list[PathRecord]] = defaultdict(list)
     for record in candidates:
@@ -81,7 +77,7 @@ def run_mcmc_chain(
                     current,
                     record,
                     proposal_ratio_mode,
-                    strict_action_config,
+                    scoring_config,
                 )
                 accepted, prob = metropolis_accept(
                     action["selected_s_eta_current"],
@@ -120,15 +116,19 @@ def compute_transition_action(
     current: PathRecord,
     candidate: PathRecord,
     proposal_ratio_mode: ProposalRatioMode,
-    strict_action_config: StrictMCMCActionConfig | None,
+    scoring_config: ScoringConfig | None,
 ) -> dict[str, float]:
     if proposal_ratio_mode == "strict":
-        if strict_action_config is None:
-            raise ValueError("strict_action_config is required for strict proposal ratio mode")
-        current_action = compute_strict_action(current, strict_action_config)
-        candidate_action = compute_strict_action(candidate, strict_action_config)
+        if scoring_config is None:
+            raise ValueError("scoring_config is required for strict proposal ratio mode")
+        if scoring_config.strict_length_alpha is None:
+            raise ValueError(
+                "strict_length_alpha is required in scoring_config for strict proposal ratio mode"
+            )
+        current_action = compute_strict_action(current, scoring_config)
+        candidate_action = compute_strict_action(candidate, scoring_config)
         return {
-            "strict_length_alpha": strict_action_config.strict_length_alpha,
+            "strict_length_alpha": scoring_config.strict_length_alpha,
             "strict_length_penalty_scaled": candidate_action["strict_length_penalty_scaled"],
             "strict_f": candidate_action["strict_f"],
             "strict_s_eta": candidate_action["strict_s_eta"],
@@ -143,20 +143,28 @@ def compute_transition_action(
 
 def compute_strict_action(
     record: PathRecord,
-    config: StrictMCMCActionConfig,
+    scoring_config: ScoringConfig,
 ) -> dict[str, float]:
+    if scoring_config.strict_length_alpha is None:
+        raise ValueError(
+            "strict_length_alpha is required in scoring_config for strict proposal ratio mode"
+        )
     length = require_output_token_count(record.output_token_count, record.path_id)
     n_scaled = compute_strict_length_penalty(
         length=length,
-        length_max=config.length_max,
-        length_scale=config.length_scale,
-        strict_length_alpha=config.strict_length_alpha,
+        length_max=scoring_config.length_max,
+        length_scale=scoring_config.length_scale,
+        strict_length_alpha=scoring_config.strict_length_alpha,
     )
     g = require_path_value(record.g, record.path_id, "G[τ]")
     k = require_path_value(record.k, record.path_id, "K[τ]")
     s0 = require_path_value(record.s0, record.path_id, "S0[τ]")
-    strict_f = config.lambda_g * g - config.lambda_n * n_scaled - config.lambda_kl * k
-    strict_s_eta = s0 - config.eta * strict_f
+    strict_f = (
+        scoring_config.lambda_G * g
+        - scoring_config.lambda_N * n_scaled
+        - scoring_config.lambda_KL * k
+    )
+    strict_s_eta = s0 - scoring_config.eta * strict_f
     return {
         "strict_length_penalty_scaled": n_scaled,
         "strict_f": strict_f,

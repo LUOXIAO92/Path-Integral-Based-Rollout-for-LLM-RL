@@ -33,6 +33,7 @@ def test_mcmc_dry_run_writes_chain_best_of_n_and_summary(tmp_path, monkeypatch) 
             lambda_KL=0.0,
             length_max=10,
             length_scale=10.0,
+            strict_length_alpha=None,
             score_config=ScoreConfig(),
         ).model_dump_json(),
         encoding="utf-8",
@@ -41,7 +42,6 @@ def test_mcmc_dry_run_writes_chain_best_of_n_and_summary(tmp_path, monkeypatch) 
     monkeypatch.setattr(script, "CANDIDATES_JSONL", candidates_path)
     monkeypatch.setattr(script, "OUTPUT_DIR", output_dir)
     monkeypatch.setattr(script, "PROPOSAL_RATIO_MODE", "normalized")
-    monkeypatch.setattr(script, "STRICT_LENGTH_ALPHA", 1.0)
     monkeypatch.setattr(script, "SCORING_CONFIG_JSON", scoring_config_path)
     monkeypatch.setattr(script, "RANDOM_SEED", 1234)
 
@@ -53,7 +53,6 @@ def test_mcmc_dry_run_writes_chain_best_of_n_and_summary(tmp_path, monkeypatch) 
     assert (output_dir / "summary.json").exists()
     config = json.loads((output_dir / "mcmc_config.json").read_text(encoding="utf-8"))
     assert config["proposal_ratio_mode"] == "normalized"
-    assert config["strict_length_alpha"] == 1.0
     assert config["scoring_config_json"] == str(scoring_config_path)
     assert "rho_prop" not in config
 
@@ -91,7 +90,7 @@ def test_strict_mcmc_config_rejects_missing_scoring_coefficients(tmp_path, monke
     monkeypatch.setattr(script, "SCORING_CONFIG_JSON", scoring_config_path)
 
     try:
-        script.load_strict_action_config()
+        script.load_strict_scoring_config()
     except Exception as exc:
         assert "eta" in str(exc)
     else:
