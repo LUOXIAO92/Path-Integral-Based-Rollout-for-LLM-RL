@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import inspect
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -23,7 +23,8 @@ class VLLMUnavailableError(RuntimeError):
 class RolloutRequest:
     problem: ProblemInput
     rollout_index: int
-    prompt: str
+    prompt_text: str
+    prompt_token_ids: list[int]
 
 
 @dataclass(frozen=True)
@@ -144,31 +145,49 @@ def run_vllm_rollouts(
         llm_kwargs["max_num_batched_tokens"] = max_num_batched_tokens
     if max_num_seqs is not None:
         llm_kwargs["max_num_seqs"] = max_num_seqs
-    llm = make_llm(LLM, **llm_kwargs)
-    explicit_logprobs_mode = sampling_params_accepts(SamplingParams, "logprobs_mode")
-    proposal_distribution = (
-        "vllm_processed" if explicit_logprobs_mode else "vllm_logprobs_default"
+    llm = make_llm(
+        LLM,
+        required_kwargs=set(llm_kwargs) - {"model"},
+        **llm_kwargs,
     )
-    raw_logprob_source = (
-        "vllm_prefill_raw" if explicit_logprobs_mode else "vllm_prefill_default"
-    )
+    tokenizer = llm.get_tokenizer()
+    if top_k <= 0:
+        raise ValueError(
+            "vLLM rollout requires top_k > 0 so returned proposal logprobs can "
+            "cover the sampled-token candidate set"
+        )
+    proposal_logprobs_count = max(1, top_k if top_k and top_k > 0 else 1)
+    proposal_distribution = "vllm_sample_logprobs"
+    raw_logprob_source = "vllm_prompt_logprobs"
     proposal_params = make_sampling_params(
         SamplingParams,
+        required_kwargs={
+            "temperature",
+            "top_p",
+            "top_k",
+            "max_tokens",
+            "logprobs",
+        },
         temperature=temperature,
         top_p=top_p,
         top_k=top_k,
         max_tokens=max_tokens,
-        logprobs=1,
-        logprobs_mode="processed_logprobs",
+        logprobs=proposal_logprobs_count,
     )
     raw_params = make_sampling_params(
         SamplingParams,
+        required_kwargs={
+            "temperature",
+            "top_p",
+            "top_k",
+            "max_tokens",
+            "prompt_logprobs",
+        },
         temperature=0.0,
         top_p=1.0,
         top_k=0,
         max_tokens=1,
-        prompt_logprobs=1,
-        logprobs_mode="raw_logprobs",
+        prompt_logprobs=proposal_logprobs_count,
     )
 
     total_rollouts = len(problems) * rollout_budget
@@ -177,12 +196,13 @@ def run_vllm_rollouts(
         for request_chunk in iter_request_chunks(
             problems,
             rollout_budget,
+            tokenizer,
             system_prompt,
             user_template,
             batch_size,
         ):
             outputs = llm.generate(
-                [request.prompt for request in request_chunk],
+                [token_prompt(request.prompt_token_ids) for request in request_chunk],
                 proposal_params,
                 use_tqdm=False,
             )
@@ -190,15 +210,28 @@ def run_vllm_rollouts(
                 prepare_generated_rollout(request, output)
                 for request, output in zip(request_chunk, outputs, strict=True)
             ]
+            proposal_errors = [item.error for item in generated if item.error is not None]
+            if proposal_errors and len(proposal_errors) == len(generated):
+                raise RuntimeError(
+                    "vLLM proposal logprob extraction failed for every item in chunk: "
+                    + "; ".join(proposal_errors[:3])
+                )
+            raw_ready = [item for item in generated if item.error is None]
             raw_results = batch_raw_prefill_logprobs(
                 llm=llm,
                 raw_params=raw_params,
-                generated=[item for item in generated if item.error is None],
+                generated=raw_ready,
             )
+            raw_errors = [item for item in raw_results if isinstance(item, Exception)]
+            if raw_ready and len(raw_errors) == len(raw_results):
+                raise RuntimeError(
+                    "vLLM raw prefill logprob extraction failed for every valid item in chunk: "
+                    + "; ".join(str(error) for error in raw_errors[:3])
+                )
             raw_results_by_path_id = {
                 item.path_id: raw_result
                 for item, raw_result in zip(
-                    [item for item in generated if item.error is None],
+                    raw_ready,
                     raw_results,
                     strict=True,
                 )
@@ -219,6 +252,7 @@ def run_vllm_rollouts(
 def iter_request_chunks(
     problems: Sequence[ProblemInput],
     rollout_budget: int,
+    tokenizer: Any,
     system_prompt: str,
     user_template: str,
     batch_size: int | None,
@@ -226,9 +260,16 @@ def iter_request_chunks(
     chunk_size = batch_size if batch_size and batch_size > 0 else rollout_budget
     chunk: list[RolloutRequest] = []
     for problem in problems:
-        prompt = render_prompt(problem, system_prompt, user_template)
         for rollout_index in range(rollout_budget):
-            chunk.append(RolloutRequest(problem, rollout_index, prompt))
+            chunk.append(
+                build_chat_rollout_request(
+                    problem,
+                    rollout_index,
+                    tokenizer,
+                    system_prompt,
+                    user_template,
+                )
+            )
             if len(chunk) == chunk_size:
                 yield chunk
                 chunk = []
@@ -291,13 +332,14 @@ def batch_raw_prefill_logprobs(
 ) -> list[list[float] | Exception]:
     if not generated:
         return []
-    full_texts = [item.request.prompt + item.path_text for item in generated]
+    full_prompts = [
+        token_prompt(item.request.prompt_token_ids + item.token_ids) for item in generated
+    ]
     try:
-        outputs = llm.generate(full_texts, raw_params, use_tqdm=False)
+        outputs = llm.generate(full_prompts, raw_params, use_tqdm=False)
     except Exception as exc:
         return [exc for _ in generated]
 
-    tokenizer = llm.get_tokenizer()
     results: list[list[float] | Exception] = []
     for item, output in zip(generated, outputs, strict=True):
         try:
@@ -306,7 +348,7 @@ def batch_raw_prefill_logprobs(
                 raise ValueError(
                     "vLLM did not return prompt_logprobs for raw prefill pass"
                 )
-            prompt_token_count = len(tokenizer.encode(item.request.prompt))
+            prompt_token_count = len(item.request.prompt_token_ids)
             raw_items = prompt_logprobs[
                 prompt_token_count : prompt_token_count + len(item.token_ids)
             ]
@@ -370,33 +412,95 @@ def invalid_vllm_record(
     )
 
 
-def render_prompt(problem: ProblemInput, system_prompt: str, user_template: str) -> str:
+def build_chat_rollout_request(
+    problem: ProblemInput,
+    rollout_index: int,
+    tokenizer: Any,
+    system_prompt: str,
+    user_template: str,
+) -> RolloutRequest:
     messages = student_messages(problem, system_prompt, user_template)
-    return "\n\n".join(f"{item['role']}: {item['content']}" for item in messages)
-
-
-def make_llm(llm_type, **kwargs):
-    filtered_kwargs = filter_supported_kwargs(llm_type, kwargs)
-    return llm_type(**filtered_kwargs)
-
-
-def sampling_params_accepts(sampling_params_type, parameter_name: str) -> bool:
-    try:
-        parameters = inspect.signature(sampling_params_type).parameters
-    except (TypeError, ValueError):
-        return False
-    return parameter_name in parameters or any(
-        parameter.kind == inspect.Parameter.VAR_KEYWORD
-        for parameter in parameters.values()
+    prompt_text = apply_chat_template_required(tokenizer, messages, tokenize=False)
+    prompt_token_ids = apply_chat_template_required(tokenizer, messages, tokenize=True)
+    return RolloutRequest(
+        problem=problem,
+        rollout_index=rollout_index,
+        prompt_text=prompt_text,
+        prompt_token_ids=prompt_token_ids,
     )
 
 
-def make_sampling_params(sampling_params_type, **kwargs):
-    filtered_kwargs = filter_supported_kwargs(sampling_params_type, kwargs)
+def apply_chat_template_required(
+    tokenizer: Any,
+    messages: list[dict],
+    tokenize: bool,
+) -> str | list[int]:
+    chat_template = getattr(tokenizer, "chat_template", None)
+    if not chat_template:
+        raise ValueError("vLLM tokenizer must provide a chat_template")
+    apply_chat_template = getattr(tokenizer, "apply_chat_template", None)
+    if apply_chat_template is None:
+        raise ValueError("vLLM tokenizer must support apply_chat_template")
+    value = apply_chat_template(
+        messages,
+        tokenize=tokenize,
+        add_generation_prompt=True,
+    )
+    if tokenize:
+        return normalize_token_ids(value)
+    if not isinstance(value, str):
+        raise ValueError("tokenizer.apply_chat_template(tokenize=False) must return str")
+    return value
+
+
+def normalize_token_ids(value: Any) -> list[int]:
+    if isinstance(value, Mapping):
+        if "input_ids" not in value:
+            keys = ", ".join(str(key) for key in value.keys())
+            raise ValueError(
+                "tokenizer.apply_chat_template(tokenize=True) returned mapping "
+                f"without input_ids: type={type(value).__name__}, keys=[{keys}]"
+            )
+        value = value["input_ids"]
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    if value and isinstance(value[0], list):
+        if len(value) != 1:
+            raise ValueError("chat template tokenization returned multiple sequences")
+        value = value[0]
+    if not isinstance(value, list) or not all(isinstance(item, int) for item in value):
+        raise ValueError("tokenizer.apply_chat_template(tokenize=True) must return token ids")
+    return list(value)
+
+
+def token_prompt(token_ids: list[int]) -> dict[str, list[int]]:
+    return {"prompt_token_ids": list(token_ids)}
+
+
+def make_llm(llm_type, required_kwargs: set[str] | None = None, **kwargs):
+    filtered_kwargs = filter_supported_kwargs(llm_type, kwargs, required_kwargs)
+    return llm_type(**filtered_kwargs)
+
+
+def make_sampling_params(
+    sampling_params_type,
+    required_kwargs: set[str] | None = None,
+    **kwargs,
+):
+    filtered_kwargs = filter_supported_kwargs(
+        sampling_params_type,
+        kwargs,
+        required_kwargs,
+    )
     return sampling_params_type(**filtered_kwargs)
 
 
-def filter_supported_kwargs(callable_type, kwargs: dict[str, Any]) -> dict[str, Any]:
+def filter_supported_kwargs(
+    callable_type,
+    kwargs: dict[str, Any],
+    required_kwargs: set[str] | None = None,
+) -> dict[str, Any]:
+    required_kwargs = required_kwargs or set()
     try:
         parameters = inspect.signature(callable_type).parameters
     except (TypeError, ValueError):
@@ -406,12 +510,22 @@ def filter_supported_kwargs(callable_type, kwargs: dict[str, Any]) -> dict[str, 
         for parameter in parameters.values()
     ):
         return kwargs
+    unsupported = set(kwargs) - set(parameters)
+    missing_required = unsupported & required_kwargs
+    if missing_required:
+        names = ", ".join(sorted(missing_required))
+        raise TypeError(f"{callable_type} does not support required kwargs: {names}")
     return {key: value for key, value in kwargs.items() if key in parameters}
 
 
 def extract_selected_logprobs(logprob_items: Any, token_ids: list[int]) -> list[float]:
     if not logprob_items:
         raise ValueError("missing selected-token logprobs")
+    if len(logprob_items) != len(token_ids):
+        raise ValueError(
+            "selected-token logprob length mismatch: "
+            f"token_count={len(token_ids)}, logprob_count={len(logprob_items)}"
+        )
     values: list[float] = []
     for item, token_id in zip(logprob_items, token_ids, strict=True):
         values.append(extract_one_logprob(item, token_id))
@@ -439,8 +553,8 @@ def valid_vllm_record(
     path_text: str,
     raw_logprobs: list[float],
     proposal_logprobs: list[float],
-    proposal_distribution: str = "vllm_processed",
-    raw_logprob_source: str = "vllm_prefill",
+    proposal_distribution: str = "vllm_sample_logprobs",
+    raw_logprob_source: str = "vllm_prompt_logprobs",
 ) -> RolloutRecord:
     if not raw_logprobs or not proposal_logprobs:
         raise ValueError("raw and proposal logprobs are required")

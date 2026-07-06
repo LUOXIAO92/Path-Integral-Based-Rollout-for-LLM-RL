@@ -15,14 +15,31 @@ from src.vllm_rollout import (
     RolloutRequest,
     VLLMUnavailableError,
     batch_raw_prefill_logprobs,
+    build_chat_rollout_request,
     ensure_vllm_available,
     iter_request_chunks,
     make_llm,
-    make_sampling_params,
+    normalize_token_ids,
+    prepare_generated_rollout,
     run_local_rollouts,
     valid_vllm_record,
 )
 from tests.test_helpers import PROBLEM
+
+
+class FakeChatTokenizer:
+    chat_template = "qwen"
+
+    def apply_chat_template(
+        self,
+        messages,
+        tokenize: bool,
+        add_generation_prompt: bool,
+    ):
+        assert add_generation_prompt is True
+        if tokenize:
+            return [101]
+        return "<chat>"
 
 
 def test_student_messages_use_prompt_template() -> None:
@@ -69,51 +86,6 @@ def test_mock_backend_writes_dual_logprobs() -> None:
     assert rows[0].raw_logprob_source == "mock_prefill"
 
 
-def test_make_sampling_params_drops_unsupported_logprobs_mode() -> None:
-    class FakeSamplingParams:
-        def __init__(
-            self,
-            max_tokens: int | None = 16,
-            logprobs: int | None = None,
-        ) -> None:
-            self.max_tokens = max_tokens
-            self.logprobs = logprobs
-
-    params = make_sampling_params(
-        FakeSamplingParams,
-        max_tokens=2048,
-        logprobs=1,
-        logprobs_mode="processed_logprobs",
-    )
-
-    assert params.max_tokens == 2048
-    assert params.logprobs == 1
-
-
-def test_make_sampling_params_preserves_supported_logprobs_mode() -> None:
-    class FakeSamplingParams:
-        def __init__(
-            self,
-            max_tokens: int | None = 16,
-            logprobs: int | None = None,
-            logprobs_mode: str | None = None,
-        ) -> None:
-            self.max_tokens = max_tokens
-            self.logprobs = logprobs
-            self.logprobs_mode = logprobs_mode
-
-    params = make_sampling_params(
-        FakeSamplingParams,
-        max_tokens=2048,
-        logprobs=1,
-        logprobs_mode="processed_logprobs",
-    )
-
-    assert params.max_tokens == 2048
-    assert params.logprobs == 1
-    assert params.logprobs_mode == "processed_logprobs"
-
-
 def test_make_llm_preserves_supported_scheduler_limits() -> None:
     class FakeLLM:
         def __init__(
@@ -142,20 +114,128 @@ def test_make_llm_preserves_supported_scheduler_limits() -> None:
     assert llm.max_num_seqs == 4
 
 
-def test_make_llm_drops_unsupported_scheduler_limits() -> None:
+def test_make_llm_rejects_unsupported_required_scheduler_limits() -> None:
     class FakeLLM:
         def __init__(self, model: str) -> None:
             self.model = model
 
-    llm = make_llm(
-        FakeLLM,
-        model="mock-model",
-        gpu_memory_utilization=0.92,
-        max_num_batched_tokens=8192,
-        max_num_seqs=4,
+    with pytest.raises(TypeError, match="max_num_seqs"):
+        make_llm(
+            FakeLLM,
+            required_kwargs={
+                "gpu_memory_utilization",
+                "max_num_batched_tokens",
+                "max_num_seqs",
+            },
+            model="mock-model",
+            gpu_memory_utilization=0.92,
+            max_num_batched_tokens=8192,
+            max_num_seqs=4,
+        )
+
+
+def test_build_chat_rollout_request_requires_chat_template() -> None:
+    class FakeTokenizer:
+        chat_template = "qwen"
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[bool, bool]] = []
+
+        def apply_chat_template(
+            self,
+            messages,
+            tokenize: bool,
+            add_generation_prompt: bool,
+        ):
+            self.calls.append((tokenize, add_generation_prompt))
+            assert messages == [
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": f"Question: {PROBLEM}"},
+            ]
+            if tokenize:
+                return [101, 102, 103]
+            return "<chat>Question</chat>"
+
+    tokenizer = FakeTokenizer()
+    problem = ProblemInput(problem_id="p1", subject="math", problem=PROBLEM)
+
+    request = build_chat_rollout_request(
+        problem,
+        0,
+        tokenizer,
+        "system",
+        "Question: {problem}",
     )
 
-    assert llm.model == "mock-model"
+    assert request.prompt_text == "<chat>Question</chat>"
+    assert request.prompt_token_ids == [101, 102, 103]
+    assert tokenizer.calls == [(False, True), (True, True)]
+
+
+def test_normalize_token_ids_accepts_mapping_input_ids() -> None:
+    assert normalize_token_ids(
+        {
+            "input_ids": [101, 102],
+            "attention_mask": [1, 1],
+        }
+    ) == [101, 102]
+
+
+def test_build_chat_rollout_request_accepts_batch_encoding_style_token_ids() -> None:
+    class FakeBatchEncoding(dict):
+        pass
+
+    class FakeTokenizer:
+        chat_template = "qwen"
+
+        def apply_chat_template(
+            self,
+            messages,
+            tokenize: bool,
+            add_generation_prompt: bool,
+        ):
+            assert add_generation_prompt is True
+            if tokenize:
+                return FakeBatchEncoding(
+                    {
+                        "input_ids": [101, 102],
+                        "attention_mask": [1, 1],
+                    }
+                )
+            return "<chat>"
+
+    request = build_chat_rollout_request(
+        ProblemInput(problem_id="p1", subject="math", problem=PROBLEM),
+        0,
+        FakeTokenizer(),
+        "system",
+        "{problem}",
+    )
+
+    assert request.prompt_text == "<chat>"
+    assert request.prompt_token_ids == [101, 102]
+
+
+def test_normalize_token_ids_rejects_mapping_without_input_ids() -> None:
+    with pytest.raises(ValueError, match="without input_ids.*keys=\\[attention_mask\\]"):
+        normalize_token_ids({"attention_mask": [1, 1]})
+
+
+def test_build_chat_rollout_request_rejects_missing_chat_template() -> None:
+    class FakeTokenizer:
+        chat_template = None
+
+        def apply_chat_template(self, messages, tokenize: bool, add_generation_prompt: bool):
+            raise AssertionError("should fail before applying template")
+
+    with pytest.raises(ValueError, match="chat_template"):
+        build_chat_rollout_request(
+            ProblemInput(problem_id="p1", subject="math", problem=PROBLEM),
+            0,
+            FakeTokenizer(),
+            "system",
+            "{problem}",
+        )
 
 
 def test_batch_raw_prefill_logprobs_handles_different_completion_lengths() -> None:
@@ -166,12 +246,14 @@ def test_batch_raw_prefill_logprobs_handles_different_completion_lengths() -> No
     class FakeLLM:
         def __init__(self) -> None:
             self.generate_use_tqdm = None
+            self.generate_prompts = None
 
         def get_tokenizer(self):
             return FakeTokenizer()
 
         def generate(self, prompts, params, use_tqdm=True):
             self.generate_use_tqdm = use_tqdm
+            self.generate_prompts = prompts
             return [
                 SimpleNamespace(
                     prompt_logprobs=[
@@ -194,18 +276,20 @@ def test_batch_raw_prefill_logprobs_handles_different_completion_lengths() -> No
     problem = ProblemInput(problem_id="p1", subject="math", problem="x")
     generated = [
         GeneratedRollout(
-            request=RolloutRequest(problem, 0, "ab"),
+            request=RolloutRequest(problem, 0, "ab", [1, 2]),
             output=SimpleNamespace(),
             path_id="p1-0000",
             path_text="cd",
             token_ids=[10, 11],
+            proposal_logprobs=[-0.01, -0.02],
         ),
         GeneratedRollout(
-            request=RolloutRequest(problem, 1, "xyz"),
+            request=RolloutRequest(problem, 1, "xyz", [1, 2, 3]),
             output=SimpleNamespace(),
             path_id="p1-0001",
             path_text="q",
             token_ids=[20],
+            proposal_logprobs=[-0.03],
         ),
     ]
 
@@ -213,6 +297,10 @@ def test_batch_raw_prefill_logprobs_handles_different_completion_lengths() -> No
     results = batch_raw_prefill_logprobs(llm, object(), generated)
 
     assert llm.generate_use_tqdm is False
+    assert llm.generate_prompts == [
+        {"prompt_token_ids": [1, 2, 10, 11]},
+        {"prompt_token_ids": [1, 2, 3, 20]},
+    ]
     assert results == [[-0.10, -0.20], [-0.30]]
 
 
@@ -226,6 +314,7 @@ def test_iter_request_chunks_flattens_by_default() -> None:
         iter_request_chunks(
             problems=problems,
             rollout_budget=3,
+            tokenizer=FakeChatTokenizer(),
             system_prompt="system",
             user_template="{problem}",
             batch_size=None,
@@ -257,6 +346,7 @@ def test_iter_request_chunks_flattens_with_explicit_batch_size() -> None:
         iter_request_chunks(
             problems=problems,
             rollout_budget=3,
+            tokenizer=FakeChatTokenizer(),
             system_prompt="system",
             user_template="{problem}",
             batch_size=4,
@@ -272,8 +362,22 @@ def test_vllm_rollouts_use_single_progress_bar(monkeypatch) -> None:
     import src.vllm_rollout as vllm_rollout
 
     class FakeTokenizer:
-        def encode(self, text: str) -> list[int]:
-            return []
+        chat_template = "qwen"
+
+        def __init__(self) -> None:
+            self.chat_calls = 0
+
+        def apply_chat_template(
+            self,
+            messages,
+            tokenize: bool,
+            add_generation_prompt: bool,
+        ):
+            self.chat_calls += 1
+            assert add_generation_prompt is True
+            if tokenize:
+                return [101, 102]
+            return "<chat>"
 
     class FakeLLM:
         instances = []
@@ -281,15 +385,23 @@ def test_vllm_rollouts_use_single_progress_bar(monkeypatch) -> None:
         def __init__(self, model: str) -> None:
             self.model = model
             self.generate_use_tqdm: list[bool] = []
+            self.generate_prompts: list[list[object]] = []
+            self.sampling_params = []
+            self.tokenizer = FakeTokenizer()
             FakeLLM.instances.append(self)
 
         def get_tokenizer(self):
-            return FakeTokenizer()
+            return self.tokenizer
 
         def generate(self, prompts, params, use_tqdm=True):
             self.generate_use_tqdm.append(use_tqdm)
+            self.generate_prompts.append(prompts)
+            self.sampling_params.append(params)
             if getattr(params, "prompt_logprobs", None):
-                return [SimpleNamespace(prompt_logprobs=[{7: -0.70}]) for _ in prompts]
+                return [
+                    SimpleNamespace(prompt_logprobs=[{}, {}, {7: -0.70}])
+                    for _ in prompts
+                ]
             return [
                 SimpleNamespace(
                     outputs=[
@@ -304,9 +416,21 @@ def test_vllm_rollouts_use_single_progress_bar(monkeypatch) -> None:
             ]
 
     class FakeSamplingParams:
-        def __init__(self, **kwargs) -> None:
-            for key, value in kwargs.items():
-                setattr(self, key, value)
+        def __init__(
+            self,
+            temperature: float,
+            top_p: float,
+            top_k: int,
+            max_tokens: int,
+            logprobs: int | None = None,
+            prompt_logprobs: int | None = None,
+        ) -> None:
+            self.temperature = temperature
+            self.top_p = top_p
+            self.top_k = top_k
+            self.max_tokens = max_tokens
+            self.logprobs = logprobs
+            self.prompt_logprobs = prompt_logprobs
 
     class FakeProgress:
         def __init__(self, total: int, desc: str) -> None:
@@ -342,7 +466,7 @@ def test_vllm_rollouts_use_single_progress_bar(monkeypatch) -> None:
             model="fake",
             temperature=1.0,
             top_p=1.0,
-            top_k=0,
+            top_k=20,
             max_tokens=8,
             batch_size=2,
             max_num_batched_tokens=None,
@@ -359,6 +483,116 @@ def test_vllm_rollouts_use_single_progress_bar(monkeypatch) -> None:
     assert progress.updates == [1, 1]
     assert progress.closed is True
     assert FakeLLM.instances[0].generate_use_tqdm == [False, False]
+    assert FakeLLM.instances[0].generate_prompts[0] == [
+        {"prompt_token_ids": [101, 102]},
+        {"prompt_token_ids": [101, 102]},
+    ]
+    assert FakeLLM.instances[0].generate_prompts[1] == [
+        {"prompt_token_ids": [101, 102, 7]},
+        {"prompt_token_ids": [101, 102, 7]},
+    ]
+    assert FakeLLM.instances[0].sampling_params[0].logprobs == 20
+    assert not hasattr(FakeLLM.instances[0].sampling_params[0], "logprobs_mode")
+    assert FakeLLM.instances[0].sampling_params[1].prompt_logprobs == 20
+    assert not hasattr(FakeLLM.instances[0].sampling_params[1], "logprobs_mode")
+    assert rows[0].proposal_token_logprobs == [-0.50]
+    assert rows[0].raw_token_logprobs == [-0.70]
+    assert rows[0].proposal_distribution == "vllm_sample_logprobs"
+    assert rows[0].raw_logprob_source == "vllm_prompt_logprobs"
+
+
+def test_prepare_generated_rollout_requires_sampled_token_logprob() -> None:
+    problem = ProblemInput(problem_id="p1", subject="math", problem=PROBLEM)
+    request = RolloutRequest(problem, 0, "<chat>", [101])
+    output = SimpleNamespace(
+        outputs=[
+            SimpleNamespace(
+                text="x",
+                token_ids=[7],
+                logprobs=[{8: -0.1}],
+            )
+        ]
+    )
+
+    generated = prepare_generated_rollout(request, output)
+
+    assert generated.error is not None
+    assert "missing logprob for selected token id 7" in generated.error
+
+
+def test_vllm_rollouts_fail_fast_when_chunk_lacks_proposal_logprobs(monkeypatch) -> None:
+    import src.vllm_rollout as vllm_rollout
+
+    class FakeTokenizer:
+        chat_template = "qwen"
+
+        def apply_chat_template(self, messages, tokenize: bool, add_generation_prompt: bool):
+            return [101] if tokenize else "<chat>"
+
+    class FakeLLM:
+        def __init__(self, model: str) -> None:
+            self.tokenizer = FakeTokenizer()
+
+        def get_tokenizer(self):
+            return self.tokenizer
+
+        def generate(self, prompts, params, use_tqdm=True):
+            return [
+                SimpleNamespace(
+                    outputs=[
+                        SimpleNamespace(
+                            text="x",
+                            token_ids=[7],
+                            logprobs=[{8: -0.1}],
+                        )
+                    ]
+                )
+                for _ in prompts
+            ]
+
+    class FakeSamplingParams:
+        def __init__(
+            self,
+            temperature: float,
+            top_p: float,
+            top_k: int,
+            max_tokens: int,
+            logprobs: int | None = None,
+            prompt_logprobs: int | None = None,
+        ) -> None:
+            self.temperature = temperature
+            self.top_p = top_p
+            self.top_k = top_k
+            self.max_tokens = max_tokens
+            self.logprobs = logprobs
+            self.prompt_logprobs = prompt_logprobs
+
+    fake_vllm = ModuleType("vllm")
+    fake_vllm.LLM = FakeLLM
+    fake_vllm.SamplingParams = FakeSamplingParams
+
+    monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
+    monkeypatch.setattr(vllm_rollout, "ensure_vllm_available", lambda: None)
+
+    with pytest.raises(RuntimeError, match="proposal logprob extraction failed"):
+        list(
+            vllm_rollout.run_vllm_rollouts(
+                run_id="run",
+                problems=[ProblemInput(problem_id="p1", subject="math", problem=PROBLEM)],
+                rollout_budget=2,
+                model="fake",
+                temperature=1.0,
+                top_p=1.0,
+                top_k=20,
+                max_tokens=8,
+                batch_size=2,
+                max_num_batched_tokens=None,
+                max_num_seqs=None,
+                gpu_memory_utilization=None,
+                system_prompt="system",
+                user_template="{problem}",
+            )
+        )
 
 
 def test_valid_vllm_record_requires_raw_and_proposal_logprobs() -> None:
