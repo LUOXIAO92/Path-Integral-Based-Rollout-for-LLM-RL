@@ -358,7 +358,7 @@ def test_iter_request_chunks_flattens_with_explicit_batch_size() -> None:
     assert chunks[0][-1].rollout_index == 0
 
 
-def test_vllm_rollouts_use_single_progress_bar(monkeypatch) -> None:
+def test_vllm_rollouts_use_single_progress_bar(tmp_path, monkeypatch) -> None:
     import src.vllm_rollout as vllm_rollout
 
     class FakeTokenizer:
@@ -458,6 +458,7 @@ def test_vllm_rollouts_use_single_progress_bar(monkeypatch) -> None:
         lambda total, desc: progress.__dict__.update(total=total, desc=desc) or progress,
     )
 
+    debug_path = tmp_path / "debug" / "vllm_generate_events.jsonl"
     rows = list(
         vllm_rollout.run_vllm_rollouts(
             run_id="run",
@@ -474,6 +475,7 @@ def test_vllm_rollouts_use_single_progress_bar(monkeypatch) -> None:
             gpu_memory_utilization=None,
             system_prompt="system",
             user_template="{problem}",
+            debug_event_path=debug_path,
         )
     )
 
@@ -499,6 +501,31 @@ def test_vllm_rollouts_use_single_progress_bar(monkeypatch) -> None:
     assert rows[0].raw_token_logprobs == [-0.70]
     assert rows[0].proposal_distribution == "vllm_sample_logprobs"
     assert rows[0].raw_logprob_source == "vllm_prompt_logprobs"
+
+    events = [
+        json.loads(line)
+        for line in debug_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert [event["event"] for event in events] == [
+        "vllm_call_start",
+        "vllm_call_end",
+        "vllm_call_start",
+        "vllm_call_end",
+        "record_yield",
+        "record_yield",
+    ]
+    assert all(event["event_time"] for event in events)
+    assert events[0]["vllm_call_id"] == events[1]["vllm_call_id"] == 1
+    assert events[0]["operation"] == "sample_completion"
+    assert events[0]["batch_size"] == 2
+    assert events[0]["items"][0]["path_id"] == "p1-0000"
+    assert events[1]["items"][0]["completion_token_count"] == 1
+    assert events[2]["vllm_call_id"] == events[3]["vllm_call_id"] == 2
+    assert events[2]["operation"] == "score_completion_logprobs"
+    assert events[2]["items"][0]["full_token_count"] == 3
+    assert events[3]["items"][0]["raw_logprob_count"] == 1
+    assert events[4]["event"] == "record_yield"
+    assert events[4]["path_id"] == "p1-0000"
 
 
 def test_prepare_generated_rollout_requires_sampled_token_logprob() -> None:
@@ -650,6 +677,11 @@ def test_run_vllm_rollout_script_mock_backend(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(script, "BACKEND", "mock")
     monkeypatch.setattr(script, "INPUT_JSONL", input_path)
     monkeypatch.setattr(script, "OUTPUT_DIR", output_dir)
+    monkeypatch.setattr(
+        script,
+        "DEBUG_EVENT_PATH",
+        output_dir / "debug" / "vllm_generate_events.jsonl",
+    )
     monkeypatch.setattr(script, "ROLLOUT_BUDGET", 1)
     monkeypatch.setattr(script, "STUDENT_BATCH_SIZE", None)
     monkeypatch.setattr(script, "STUDENT_MAX_NUM_BATCHED_TOKENS", 8192)
@@ -680,6 +712,7 @@ def test_run_vllm_rollout_script_mock_backend(tmp_path, monkeypatch) -> None:
     assert captured["max_num_batched_tokens"] == 8192
     assert captured["max_num_seqs"] == 4
     assert captured["gpu_memory_utilization"] == 0.92
+    assert captured["debug_event_path"] == output_dir / "debug" / "vllm_generate_events.jsonl"
     assert captured["rows_is_list"] is False
     assert (output_dir / "rollout_config.json").exists()
     assert (output_dir / "rollouts.jsonl").exists()
@@ -691,7 +724,12 @@ def test_run_vllm_rollout_script_mock_backend(tmp_path, monkeypatch) -> None:
             "gpu_memory_utilization": 0.92,
             "max_num_batched_tokens": 8192,
             "max_num_seqs": 4,
-        }
+        },
+        "debug": {
+            "vllm_generate_events": script.display_path(
+                output_dir / "debug" / "vllm_generate_events.jsonl"
+            ),
+        },
     }
     rows = [
         json.loads(line)

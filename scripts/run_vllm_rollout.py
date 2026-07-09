@@ -21,19 +21,27 @@ STUDENT_MODEL = "Qwen/Qwen3-0.6B"
 STUDENT_TEMPERATURE = 1 # 0.8
 STUDENT_TOP_P = 0.95
 STUDENT_TOP_K = 20
-STUDENT_MAX_NEW_TOKENS = 2048
-STUDENT_MAX_NUM_BATCHED_TOKENS = 8192
-STUDENT_MAX_NUM_SEQS = 4
-STUDENT_GPU_MEMORY_UTILIZATION = 0.85
-STUDENT_BATCH_SIZE = 4
+STUDENT_MAX_NEW_TOKENS = 8192
+STUDENT_MAX_NUM_BATCHED_TOKENS = 16384
+STUDENT_MAX_NUM_SEQS = 20
+STUDENT_GPU_MEMORY_UTILIZATION = 0.8
+STUDENT_BATCH_SIZE = 20
 
 INPUT_JSONL = REPO_ROOT / "data" / "problems.jsonl"
 OUTPUT_DIR = REPO_ROOT / "outputs" / "vllm_rollout"
+DEBUG_EVENT_PATH = OUTPUT_DIR / "debug" / "vllm_generate_events.jsonl"
 DATASET_NAME = "prepared_problems_jsonl"
 ROLLOUT_BUDGET = 10
 
 STUDENT_SYSTEM_PROMPT = "Solve the problem. Show the reasoning needed to support the final answer."
 STUDENT_USER_TEMPLATE = "{problem}"
+
+
+def display_path(path: Path) -> str:
+    try:
+        return str(path.relative_to(REPO_ROOT))
+    except ValueError:
+        return str(path)
 
 
 def main() -> None:
@@ -54,7 +62,10 @@ def main() -> None:
                 "gpu_memory_utilization": STUDENT_GPU_MEMORY_UTILIZATION,
                 "max_num_batched_tokens": STUDENT_MAX_NUM_BATCHED_TOKENS,
                 "max_num_seqs": STUDENT_MAX_NUM_SEQS,
-            }
+            },
+            "debug": {
+                "vllm_generate_events": display_path(DEBUG_EVENT_PATH),
+            },
         },
         rollout_budget=ROLLOUT_BUDGET,
     )
@@ -66,6 +77,7 @@ def main() -> None:
         f"max_num_batched_tokens={STUDENT_MAX_NUM_BATCHED_TOKENS}, "
         f"max_num_seqs={STUDENT_MAX_NUM_SEQS}, batch_size={STUDENT_BATCH_SIZE}"
     )
+    print(f"Writing vLLM debug events to {DEBUG_EVENT_PATH}")
     rows = run_local_rollouts(
         backend=BACKEND,
         run_id=run_id,
@@ -82,6 +94,7 @@ def main() -> None:
         gpu_memory_utilization=STUDENT_GPU_MEMORY_UTILIZATION,
         system_prompt=STUDENT_SYSTEM_PROMPT,
         user_template=STUDENT_USER_TEMPLATE,
+        debug_event_path=DEBUG_EVENT_PATH,
     )
     write_json(OUTPUT_DIR / "rollout_config.json", config)
     write_rollouts_with_logprob_sidecars(OUTPUT_DIR / "rollouts.jsonl", rows)
