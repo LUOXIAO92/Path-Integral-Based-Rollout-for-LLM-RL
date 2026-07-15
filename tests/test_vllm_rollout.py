@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from types import ModuleType, SimpleNamespace
 
 import numpy as np
 import pytest
 
-from src.io_utils import hydrate_rollout_logprobs, read_model_jsonl
+from src.io_utils import (
+    RolloutShardWriter,
+    hydrate_rollout_logprobs,
+    load_rollout_resume_state,
+    read_model_jsonl,
+)
 from src.prompts import student_messages
 from src.schemas import ProblemInput, RolloutRecord
 from src.vllm_rollout import (
@@ -358,7 +364,7 @@ def test_iter_request_chunks_flattens_with_explicit_batch_size() -> None:
     assert chunks[0][-1].rollout_index == 0
 
 
-def test_vllm_rollouts_use_single_progress_bar(tmp_path, monkeypatch) -> None:
+def test_vllm_rollouts_use_token_id_prompts_and_append_debug(tmp_path, monkeypatch) -> None:
     import src.vllm_rollout as vllm_rollout
 
     class FakeTokenizer:
@@ -382,8 +388,15 @@ def test_vllm_rollouts_use_single_progress_bar(tmp_path, monkeypatch) -> None:
     class FakeLLM:
         instances = []
 
-        def __init__(self, model: str) -> None:
+        def __init__(
+            self,
+            model: str,
+            enforce_eager: bool,
+            disable_log_stats: bool,
+        ) -> None:
             self.model = model
+            self.enforce_eager = enforce_eager
+            self.disable_log_stats = disable_log_stats
             self.generate_use_tqdm: list[bool] = []
             self.generate_prompts: list[list[object]] = []
             self.sampling_params = []
@@ -432,31 +445,12 @@ def test_vllm_rollouts_use_single_progress_bar(tmp_path, monkeypatch) -> None:
             self.logprobs = logprobs
             self.prompt_logprobs = prompt_logprobs
 
-    class FakeProgress:
-        def __init__(self, total: int, desc: str) -> None:
-            self.total = total
-            self.desc = desc
-            self.updates: list[int] = []
-            self.closed = False
-
-        def update(self, count: int) -> None:
-            self.updates.append(count)
-
-        def close(self) -> None:
-            self.closed = True
-
     fake_vllm = ModuleType("vllm")
     fake_vllm.LLM = FakeLLM
     fake_vllm.SamplingParams = FakeSamplingParams
-    progress = FakeProgress(total=0, desc="")
 
     monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
     monkeypatch.setattr(vllm_rollout, "ensure_vllm_available", lambda: None)
-    monkeypatch.setattr(
-        vllm_rollout,
-        "make_progress",
-        lambda total, desc: progress.__dict__.update(total=total, desc=desc) or progress,
-    )
 
     debug_path = tmp_path / "debug" / "vllm_generate_events.jsonl"
     rows = list(
@@ -473,17 +467,18 @@ def test_vllm_rollouts_use_single_progress_bar(tmp_path, monkeypatch) -> None:
             max_num_batched_tokens=None,
             max_num_seqs=None,
             gpu_memory_utilization=None,
+            enforce_eager=True,
+            disable_log_stats=False,
             system_prompt="system",
             user_template="{problem}",
             debug_event_path=debug_path,
+            attempt_id="attempt-1",
         )
     )
 
     assert [row.is_valid for row in rows] == [True, True]
-    assert progress.total == 2
-    assert progress.desc == "vLLM rollout"
-    assert progress.updates == [1, 1]
-    assert progress.closed is True
+    assert FakeLLM.instances[0].enforce_eager is True
+    assert FakeLLM.instances[0].disable_log_stats is False
     assert FakeLLM.instances[0].generate_use_tqdm == [False, False]
     assert FakeLLM.instances[0].generate_prompts[0] == [
         {"prompt_token_ids": [101, 102]},
@@ -511,10 +506,11 @@ def test_vllm_rollouts_use_single_progress_bar(tmp_path, monkeypatch) -> None:
         "vllm_call_end",
         "vllm_call_start",
         "vllm_call_end",
-        "record_yield",
-        "record_yield",
+        "record_ready",
+        "record_ready",
     ]
     assert all(event["event_time"] for event in events)
+    assert {event["attempt_id"] for event in events} == {"attempt-1"}
     assert events[0]["vllm_call_id"] == events[1]["vllm_call_id"] == 1
     assert events[0]["operation"] == "sample_completion"
     assert events[0]["batch_size"] == 2
@@ -524,7 +520,7 @@ def test_vllm_rollouts_use_single_progress_bar(tmp_path, monkeypatch) -> None:
     assert events[2]["operation"] == "score_completion_logprobs"
     assert events[2]["items"][0]["full_token_count"] == 3
     assert events[3]["items"][0]["raw_logprob_count"] == 1
-    assert events[4]["event"] == "record_yield"
+    assert events[4]["event"] == "record_ready"
     assert events[4]["path_id"] == "p1-0000"
 
 
@@ -557,7 +553,12 @@ def test_vllm_rollouts_fail_fast_when_chunk_lacks_proposal_logprobs(monkeypatch)
             return [101] if tokenize else "<chat>"
 
     class FakeLLM:
-        def __init__(self, model: str) -> None:
+        def __init__(
+            self,
+            model: str,
+            enforce_eager: bool,
+            disable_log_stats: bool,
+        ) -> None:
             self.tokenizer = FakeTokenizer()
 
         def get_tokenizer(self):
@@ -616,6 +617,8 @@ def test_vllm_rollouts_fail_fast_when_chunk_lacks_proposal_logprobs(monkeypatch)
                 max_num_batched_tokens=None,
                 max_num_seqs=None,
                 gpu_memory_utilization=None,
+                enforce_eager=True,
+                disable_log_stats=False,
                 system_prompt="system",
                 user_template="{problem}",
             )
@@ -655,120 +658,360 @@ def test_vllm_backend_reports_missing_vllm(monkeypatch) -> None:
         ensure_vllm_available()
 
 
-def test_run_vllm_rollout_script_mock_backend(tmp_path, monkeypatch) -> None:
+def make_rollout(
+    path_id: str,
+    rollout_index: int,
+    run_id: str = "run",
+    problem_id: str = "p1",
+    is_valid: bool = True,
+) -> RolloutRecord:
+    raw = [-0.3, -0.2, -0.1] if is_valid else []
+    proposal = [-0.25, -0.15, -0.05] if is_valid else []
+    return RolloutRecord(
+        run_id=run_id,
+        problem_id=problem_id,
+        path_id=path_id,
+        rollout_index=rollout_index,
+        path_text="answer",
+        token_logprobs=raw,
+        raw_token_logprobs=raw,
+        proposal_token_logprobs=proposal,
+        output_token_count=len(raw),
+        raw_logprob_sum=sum(raw) if raw else None,
+        proposal_logprob_sum=sum(proposal) if proposal else None,
+        raw_logprob_mean=sum(raw) / len(raw) if raw else None,
+        proposal_logprob_mean=sum(proposal) / len(proposal) if proposal else None,
+        proposal_distribution="test",
+        raw_logprob_source="test",
+        is_valid=is_valid,
+        error=None if is_valid else "failed",
+    )
+
+
+def test_rollout_shard_writer_commits_valid_batch_and_skips_invalid(tmp_path) -> None:
+    rollouts_path = tmp_path / "rollouts.jsonl"
+    writer = RolloutShardWriter(rollouts_path, attempt_id="attempt")
+
+    commit = writer.commit_batch(
+        [
+            make_rollout("p1-0000", 0),
+            make_rollout("p1-0001", 1, is_valid=False),
+        ]
+    )
+
+    assert commit.logprob_file == "logprobs/shard-000000"
+    assert [row.path_id for row in commit.records] == ["p1-0000"]
+    assert commit.invalid_path_ids == ("p1-0001",)
+    rows = read_model_jsonl(rollouts_path, RolloutRecord)
+    assert [row.path_id for row in rows] == ["p1-0000"]
+    assert rows[0].logprob_file == "logprobs/shard-000000"
+    assert not rows[0].raw_token_logprobs
+    hydrated = hydrate_rollout_logprobs(rows, tmp_path)
+    assert hydrated[0].raw_token_logprobs == pytest.approx([-0.3, -0.2, -0.1])
+    assert hydrated[0].proposal_token_logprobs == pytest.approx(
+        [-0.25, -0.15, -0.05]
+    )
+
+
+def test_resume_state_drops_truncated_tail_and_missing_sidecar(tmp_path) -> None:
+    rollouts_path = tmp_path / "rollouts.jsonl"
+    writer = RolloutShardWriter(rollouts_path, attempt_id="attempt")
+    writer.commit_batch(
+        [make_rollout("p1-0000", 0), make_rollout("p1-0001", 1)]
+    )
+    with rollouts_path.open("ab") as handle:
+        handle.write(b'{"path_id": "partial"')
+    discarded: list[tuple[str | None, str]] = []
+
+    state = load_rollout_resume_state(
+        rollouts_path,
+        tmp_path,
+        {"p1-0000": ("p1", 0), "p1-0001": ("p1", 1)},
+        "run",
+        on_discard=lambda path_id, reason: discarded.append((path_id, reason)),
+    )
+
+    assert state.completed_path_ids == frozenset({"p1-0000", "p1-0001"})
+    assert state.truncated_tail is True
+    assert rollouts_path.read_bytes().endswith(b"\n")
+    assert any(path_id is None and "truncated" in reason for path_id, reason in discarded)
+
+    (tmp_path / "logprobs" / "shard-000000" / "proposal.npz").unlink()
+    state = load_rollout_resume_state(
+        rollouts_path,
+        tmp_path,
+        {"p1-0000": ("p1", 0), "p1-0001": ("p1", 1)},
+        "run",
+    )
+    assert state.completed_path_ids == frozenset()
+    assert rollouts_path.read_text(encoding="utf-8") == ""
+
+
+def test_resume_state_canonicalizes_valid_final_line_without_newline(tmp_path) -> None:
+    rollouts_path = tmp_path / "rollouts.jsonl"
+    RolloutShardWriter(rollouts_path, attempt_id="attempt").commit_batch(
+        [make_rollout("p1-0000", 0)]
+    )
+    rollouts_path.write_bytes(rollouts_path.read_bytes().removesuffix(b"\n"))
+
+    state = load_rollout_resume_state(
+        rollouts_path,
+        tmp_path,
+        {"p1-0000": ("p1", 0)},
+        "run",
+    )
+
+    assert state.completed_path_ids == frozenset({"p1-0000"})
+    assert state.truncated_tail is False
+    assert rollouts_path.read_bytes().endswith(b"\n")
+
+
+def test_resume_ignores_orphan_and_temporary_shards(tmp_path) -> None:
+    rollouts_path = tmp_path / "rollouts.jsonl"
+    RolloutShardWriter(rollouts_path, attempt_id="first").commit_batch(
+        [make_rollout("p1-0000", 0)]
+    )
+    rollouts_path.unlink()
+    temporary_shard = tmp_path / "logprobs" / ".shard-000001.crashed.tmp"
+    temporary_shard.mkdir()
+
+    state = load_rollout_resume_state(
+        rollouts_path,
+        tmp_path,
+        {"p1-0000": ("p1", 0)},
+        "run",
+    )
+    assert state.completed_path_ids == frozenset()
+
+    commit = RolloutShardWriter(
+        rollouts_path,
+        attempt_id="second",
+    ).commit_batch([make_rollout("p1-0000", 0)])
+
+    assert commit.logprob_file == "logprobs/shard-000001"
+    assert (tmp_path / "logprobs" / "shard-000000").is_dir()
+    assert temporary_shard.is_dir()
+    state = load_rollout_resume_state(
+        rollouts_path,
+        tmp_path,
+        {"p1-0000": ("p1", 0)},
+        "run",
+    )
+    assert state.completed_path_ids == frozenset({"p1-0000"})
+
+
+def test_resume_rejects_duplicate_complete_path_id(tmp_path) -> None:
+    rollouts_path = tmp_path / "rollouts.jsonl"
+    writer = RolloutShardWriter(rollouts_path, attempt_id="attempt")
+    writer.commit_batch([make_rollout("p1-0000", 0)])
+    writer.commit_batch([make_rollout("p1-0000", 0)])
+
+    with pytest.raises(ValueError, match="duplicate complete path_id p1-0000"):
+        load_rollout_resume_state(
+            rollouts_path,
+            tmp_path,
+            {"p1-0000": ("p1", 0)},
+            "run",
+        )
+
+
+class FakeProgress:
+    def __init__(self, total: int, initial: int) -> None:
+        self.total = total
+        self.initial = initial
+        self.updates: list[int] = []
+        self.closed = False
+
+    def update(self, count: int) -> None:
+        self.updates.append(count)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def configure_mock_rollout_script(tmp_path, monkeypatch, rollout_budget: int = 2):
     import scripts.run_vllm_rollout as script
 
     input_path = tmp_path / "input.jsonl"
     input_path.write_text(
-        json.dumps(
-            {
-                "problem_id": "p1",
-                "subject": "math",
-                "problem": PROBLEM,
-                "reference_answer": "42",
-                "test_result": "",
-            }
+        "\n".join(
+            json.dumps(
+                {
+                    "problem_id": problem_id,
+                    "subject": "math",
+                    "problem": PROBLEM,
+                    "reference_answer": "42",
+                    "test_result": "",
+                }
+            )
+            for problem_id in ("p1", "p2")
         )
         + "\n",
         encoding="utf-8",
     )
     output_dir = tmp_path / "out"
-
+    debug_path = output_dir / "debug" / "vllm_generate_events.jsonl"
     monkeypatch.setattr(script, "BACKEND", "mock")
     monkeypatch.setattr(script, "INPUT_JSONL", input_path)
     monkeypatch.setattr(script, "OUTPUT_DIR", output_dir)
-    monkeypatch.setattr(
-        script,
-        "DEBUG_EVENT_PATH",
-        output_dir / "debug" / "vllm_generate_events.jsonl",
-    )
-    monkeypatch.setattr(script, "ROLLOUT_BUDGET", 1)
-    monkeypatch.setattr(script, "STUDENT_BATCH_SIZE", None)
+    monkeypatch.setattr(script, "DEBUG_EVENT_PATH", debug_path)
+    monkeypatch.setattr(script, "ROLLOUT_BUDGET", rollout_budget)
+    monkeypatch.setattr(script, "STUDENT_BATCH_SIZE", 2)
     monkeypatch.setattr(script, "STUDENT_MAX_NUM_BATCHED_TOKENS", 8192)
-    monkeypatch.setattr(script, "STUDENT_MAX_NUM_SEQS", 4)
-    monkeypatch.setattr(script, "STUDENT_GPU_MEMORY_UTILIZATION", 0.92)
-    captured: dict[str, object] = {}
-    real_run_local_rollouts = script.run_local_rollouts
-    real_write_rollouts_with_logprob_sidecars = script.write_rollouts_with_logprob_sidecars
+    monkeypatch.setattr(script, "STUDENT_MAX_NUM_SEQS", 2)
+    monkeypatch.setattr(script, "STUDENT_GPU_MEMORY_UTILIZATION", 0.8)
+    monkeypatch.setattr(script, "RESUME", True)
+    assert os.environ["VLLM_LOGGING_LEVEL"] == "DEBUG"
+    assert os.environ["VLLM_LOG_STATS_INTERVAL"] == "1"
+    return script, input_path, output_dir, debug_path
 
-    def capture_run_local_rollouts(**kwargs):
-        captured.update(kwargs)
-        return real_run_local_rollouts(**kwargs)
 
-    def capture_write_rollouts_with_logprob_sidecars(path, rows):
-        captured["rows_is_list"] = isinstance(rows, list)
-        return real_write_rollouts_with_logprob_sidecars(path, rows)
-
-    monkeypatch.setattr(script, "run_local_rollouts", capture_run_local_rollouts)
+def test_run_vllm_rollout_script_resumes_committed_paths(tmp_path, monkeypatch) -> None:
+    script, _, output_dir, debug_path = configure_mock_rollout_script(
+        tmp_path, monkeypatch
+    )
+    real_batches = script.run_local_rollout_batches
+    completed_arguments: list[frozenset[str]] = []
+    progresses: list[FakeProgress] = []
     monkeypatch.setattr(
         script,
-        "write_rollouts_with_logprob_sidecars",
-        capture_write_rollouts_with_logprob_sidecars,
+        "make_progress",
+        lambda total, desc, initial=0: progresses.append(
+            FakeProgress(total, initial)
+        )
+        or progresses[-1],
     )
 
+    def interrupted_batches(**kwargs):
+        assert kwargs["enforce_eager"] is True
+        assert kwargs["disable_log_stats"] is False
+        completed_arguments.append(frozenset(kwargs["completed_path_ids"]))
+        batches = iter(real_batches(**kwargs))
+        yield next(batches)
+        raise RuntimeError("simulated interruption before the next batch")
+
+    monkeypatch.setattr(script, "run_local_rollout_batches", interrupted_batches)
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        script.main()
+    assert len(read_model_jsonl(output_dir / "rollouts.jsonl", RolloutRecord)) == 2
+
+    def resumed_batches(**kwargs):
+        completed_arguments.append(frozenset(kwargs["completed_path_ids"]))
+        yield from real_batches(**kwargs)
+
+    monkeypatch.setattr(script, "run_local_rollout_batches", resumed_batches)
+    monkeypatch.setattr(script, "STUDENT_MAX_NUM_SEQS", 7)
+    monkeypatch.setattr(script, "STUDENT_GPU_MEMORY_UTILIZATION", 0.6)
     script.main()
 
-    assert captured["batch_size"] is None
-    assert captured["max_num_batched_tokens"] == 8192
-    assert captured["max_num_seqs"] == 4
-    assert captured["gpu_memory_utilization"] == 0.92
-    assert captured["debug_event_path"] == output_dir / "debug" / "vllm_generate_events.jsonl"
-    assert captured["rows_is_list"] is False
-    assert (output_dir / "rollout_config.json").exists()
-    assert (output_dir / "rollouts.jsonl").exists()
-    assert (output_dir / "logprobs" / "raw.npz").exists()
-    assert (output_dir / "logprobs" / "proposal.npz").exists()
-    config = json.loads((output_dir / "rollout_config.json").read_text(encoding="utf-8"))
-    assert config["extra_body"] == {
-        "vllm_engine_args": {
-            "gpu_memory_utilization": 0.92,
-            "max_num_batched_tokens": 8192,
-            "max_num_seqs": 4,
-        },
-        "debug": {
-            "vllm_generate_events": script.display_path(
-                output_dir / "debug" / "vllm_generate_events.jsonl"
-            ),
-        },
-    }
-    rows = [
-        json.loads(line)
-        for line in (output_dir / "rollouts.jsonl").read_text(encoding="utf-8").splitlines()
+    rows = read_model_jsonl(output_dir / "rollouts.jsonl", RolloutRecord)
+    assert len(rows) == 4
+    assert len({row.path_id for row in rows}) == 4
+    assert len({row.run_id for row in rows}) == 1
+    assert completed_arguments == [
+        frozenset(),
+        frozenset({"p1-0000", "p1-0001"}),
     ]
-    assert len(rows) == 1
-    assert rows[0]["logprob_file"] == "logprobs"
-    assert rows[0]["logprob_dtype"] == "float32"
-    assert rows[0]["output_token_count"] == 3
-    assert rows[0]["raw_logprob_sum"] == pytest.approx(-0.60)
-    assert rows[0]["proposal_logprob_sum"] == pytest.approx(-0.45)
-    assert rows[0]["raw_logprob_mean"] == pytest.approx(-0.20)
-    assert rows[0]["proposal_logprob_mean"] == pytest.approx(-0.15)
-    assert "token_logprobs" not in rows[0]
-    assert "raw_token_logprobs" not in rows[0]
-    assert "proposal_token_logprobs" not in rows[0]
-
-    path_id = rows[0]["path_id"]
-    with (
-        np.load(output_dir / rows[0]["logprob_file"] / "raw.npz") as raw_npz,
-        np.load(output_dir / rows[0]["logprob_file"] / "proposal.npz") as proposal_npz,
-    ):
-        np.testing.assert_allclose(raw_npz[path_id], [-0.30, -0.20, -0.10])
-        np.testing.assert_allclose(proposal_npz[path_id], [-0.25, -0.15, -0.05])
-
-    rollout = read_model_jsonl(output_dir / "rollouts.jsonl", RolloutRecord)[0].model_copy(
-        update={
-            "raw_logprob_sum": None,
-            "proposal_logprob_sum": None,
-            "raw_logprob_mean": None,
-            "proposal_logprob_mean": None,
-        }
+    assert [(progress.initial, progress.updates) for progress in progresses] == [
+        (0, [2]),
+        (2, [2]),
+    ]
+    assert all(progress.closed for progress in progresses)
+    assert len(hydrate_rollout_logprobs(rows, output_dir)) == 4
+    config = json.loads(
+        (output_dir / "rollout_config.json").read_text(encoding="utf-8")
     )
-    assert rollout.raw_token_logprobs == []
-    hydrated = hydrate_rollout_logprobs([rollout], output_dir)
-    assert hydrated[0].output_token_count == 3
-    assert hydrated[0].raw_logprob_sum == pytest.approx(-0.60)
-    assert hydrated[0].proposal_logprob_sum == pytest.approx(-0.45)
-    assert hydrated[0].raw_logprob_mean == pytest.approx(-0.20)
-    assert hydrated[0].proposal_logprob_mean == pytest.approx(-0.15)
-    assert hydrated[0].raw_token_logprobs == pytest.approx([-0.30, -0.20, -0.10])
-    assert hydrated[0].proposal_token_logprobs == pytest.approx([-0.25, -0.15, -0.05])
+    assert config["extra_body"]["vllm_engine_args"]["enforce_eager"] is True
+    assert config["extra_body"]["vllm_engine_args"]["disable_log_stats"] is False
+
+    monkeypatch.setattr(
+        script,
+        "run_local_rollout_batches",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("complete resume must not initialize rollout backend")
+        ),
+    )
+    script.main()
+
+    events = [
+        json.loads(line)
+        for line in debug_path.read_text(encoding="utf-8").splitlines()
+    ]
+    resume_events = [event for event in events if event["event"] == "resume_state"]
+    assert len(resume_events) == 3
+    assert len({event["attempt_id"] for event in resume_events}) == 3
+    assert [event["completed_count"] for event in resume_events] == [0, 2, 4]
+    assert all(event["execution"]["enforce_eager"] is True for event in resume_events)
+    assert all(
+        event["execution"]["disable_log_stats"] is False for event in resume_events
+    )
+    assert len(
+        [event for event in events if event["event"] == "artifact_batch_commit"]
+    ) == 2
+
+
+@pytest.mark.parametrize(
+    ("setting", "replacement"),
+    [
+        ("STUDENT_MODEL", "different-model"),
+        ("STUDENT_TEMPERATURE", 0.5),
+        ("STUDENT_TOP_P", 0.5),
+        ("STUDENT_TOP_K", 5),
+        ("STUDENT_MAX_NEW_TOKENS", 64),
+        ("ROLLOUT_BUDGET", 3),
+        ("STUDENT_SYSTEM_PROMPT", "different system prompt"),
+        ("STUDENT_USER_TEMPLATE", "Question: {problem}"),
+    ],
+)
+def test_rollout_resume_rejects_semantic_config_changes(
+    tmp_path,
+    monkeypatch,
+    setting,
+    replacement,
+) -> None:
+    script, _, _, _ = configure_mock_rollout_script(
+        tmp_path, monkeypatch, rollout_budget=1
+    )
+    monkeypatch.setattr(
+        script,
+        "make_progress",
+        lambda total, desc, initial=0: FakeProgress(total, initial),
+    )
+    script.main()
+
+    monkeypatch.setattr(script, setting, replacement)
+    with pytest.raises(ValueError, match="resume contract mismatch"):
+        script.main()
+
+
+def test_rollout_resume_rejects_input_change(tmp_path, monkeypatch) -> None:
+    script, input_path, _, _ = configure_mock_rollout_script(
+        tmp_path, monkeypatch, rollout_budget=1
+    )
+    monkeypatch.setattr(
+        script,
+        "make_progress",
+        lambda total, desc, initial=0: FakeProgress(total, initial),
+    )
+    script.main()
+    with input_path.open("a", encoding="utf-8") as handle:
+        handle.write("\n")
+
+    with pytest.raises(ValueError, match="resume contract mismatch"):
+        script.main()
+
+
+def test_rollout_resume_false_refuses_existing_output(tmp_path, monkeypatch) -> None:
+    script, _, _, _ = configure_mock_rollout_script(
+        tmp_path, monkeypatch, rollout_budget=1
+    )
+    monkeypatch.setattr(
+        script,
+        "make_progress",
+        lambda total, desc, initial=0: FakeProgress(total, initial),
+    )
+    script.main()
+    monkeypatch.setattr(script, "RESUME", False)
+
+    with pytest.raises(FileExistsError, match="refusing to overwrite"):
+        script.main()

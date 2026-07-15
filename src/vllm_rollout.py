@@ -5,7 +5,7 @@ import inspect
 import json
 import os
 import time
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -68,13 +68,21 @@ def run_local_rollouts(
     max_num_batched_tokens: int | None = None,
     max_num_seqs: int | None = None,
     gpu_memory_utilization: float | None = None,
+    enforce_eager: bool = False,
+    disable_log_stats: bool = True,
     debug_event_path: str | Path | None = None,
+    attempt_id: str | None = None,
+    completed_path_ids: Collection[str] = (),
 ) -> Iterator[RolloutRecord]:
-    if backend == "mock":
-        yield from run_mock_rollouts(run_id, problems, rollout_budget)
-        return
-    if backend == "vllm":
-        yield from run_vllm_rollouts(
+    debug_events = DebugEventWriter(
+        debug_event_path,
+        run_id=run_id,
+        attempt_id=attempt_id or run_id,
+    )
+    try:
+        debug_events.open()
+        for batch in run_local_rollout_batches(
+            backend=backend,
             run_id=run_id,
             problems=problems,
             rollout_budget=rollout_budget,
@@ -87,9 +95,72 @@ def run_local_rollouts(
             max_num_batched_tokens=max_num_batched_tokens,
             max_num_seqs=max_num_seqs,
             gpu_memory_utilization=gpu_memory_utilization,
+            enforce_eager=enforce_eager,
+            disable_log_stats=disable_log_stats,
             system_prompt=system_prompt,
             user_template=user_template,
-            debug_event_path=debug_event_path,
+            completed_path_ids=completed_path_ids,
+            debug_events=debug_events,
+        ):
+            yield from batch
+    finally:
+        debug_events.close()
+
+
+def run_local_rollout_batches(
+    backend: str,
+    run_id: str,
+    problems: Sequence[ProblemInput],
+    rollout_budget: int,
+    model: str,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    max_tokens: int,
+    system_prompt: str,
+    user_template: str,
+    batch_size: int | None = None,
+    max_num_batched_tokens: int | None = None,
+    max_num_seqs: int | None = None,
+    gpu_memory_utilization: float | None = None,
+    enforce_eager: bool = False,
+    disable_log_stats: bool = True,
+    completed_path_ids: Collection[str] = (),
+    debug_events: DebugEventWriter | None = None,
+) -> Iterator[list[RolloutRecord]]:
+    debug_events = debug_events or DebugEventWriter(None)
+    if backend == "mock":
+        for batch in run_mock_rollout_batches(
+            run_id,
+            problems,
+            rollout_budget,
+            batch_size,
+            completed_path_ids,
+        ):
+            for record in batch:
+                write_record_ready_event(debug_events, record)
+            yield batch
+        return
+    if backend == "vllm":
+        yield from run_vllm_rollout_batches(
+            run_id=run_id,
+            problems=problems,
+            rollout_budget=rollout_budget,
+            model=model,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            max_tokens=max_tokens,
+            batch_size=batch_size,
+            max_num_batched_tokens=max_num_batched_tokens,
+            max_num_seqs=max_num_seqs,
+            gpu_memory_utilization=gpu_memory_utilization,
+            enforce_eager=enforce_eager,
+            disable_log_stats=disable_log_stats,
+            system_prompt=system_prompt,
+            user_template=user_template,
+            completed_path_ids=completed_path_ids,
+            debug_events=debug_events,
         )
         return
     raise ValueError("backend must be 'mock' or 'vllm'")
@@ -126,6 +197,26 @@ def run_mock_rollouts(
             )
 
 
+def run_mock_rollout_batches(
+    run_id: str,
+    problems: Sequence[ProblemInput],
+    rollout_budget: int,
+    batch_size: int | None,
+    completed_path_ids: Collection[str],
+) -> Iterator[list[RolloutRecord]]:
+    chunk_size = batch_size if batch_size and batch_size > 0 else rollout_budget
+    batch: list[RolloutRecord] = []
+    for row in run_mock_rollouts(run_id, problems, rollout_budget):
+        if row.path_id in completed_path_ids:
+            continue
+        batch.append(row)
+        if len(batch) == chunk_size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+
+
 def run_vllm_rollouts(
     run_id: str,
     problems: Sequence[ProblemInput],
@@ -141,12 +232,74 @@ def run_vllm_rollouts(
     max_num_batched_tokens: int | None = None,
     max_num_seqs: int | None = None,
     gpu_memory_utilization: float | None = None,
+    enforce_eager: bool = False,
+    disable_log_stats: bool = True,
     debug_event_path: str | Path | None = None,
+    attempt_id: str | None = None,
+    completed_path_ids: Collection[str] = (),
 ) -> Iterator[RolloutRecord]:
+    debug_events = DebugEventWriter(
+        debug_event_path,
+        run_id=run_id,
+        attempt_id=attempt_id or run_id,
+    )
+    try:
+        debug_events.open()
+        for batch in run_vllm_rollout_batches(
+            run_id=run_id,
+            problems=problems,
+            rollout_budget=rollout_budget,
+            model=model,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            max_tokens=max_tokens,
+            system_prompt=system_prompt,
+            user_template=user_template,
+            batch_size=batch_size,
+            max_num_batched_tokens=max_num_batched_tokens,
+            max_num_seqs=max_num_seqs,
+            gpu_memory_utilization=gpu_memory_utilization,
+            enforce_eager=enforce_eager,
+            disable_log_stats=disable_log_stats,
+            completed_path_ids=completed_path_ids,
+            debug_events=debug_events,
+        ):
+            yield from batch
+    finally:
+        debug_events.close()
+
+
+def run_vllm_rollout_batches(
+    run_id: str,
+    problems: Sequence[ProblemInput],
+    rollout_budget: int,
+    model: str,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    max_tokens: int,
+    system_prompt: str,
+    user_template: str,
+    batch_size: int | None = None,
+    max_num_batched_tokens: int | None = None,
+    max_num_seqs: int | None = None,
+    gpu_memory_utilization: float | None = None,
+    enforce_eager: bool = False,
+    disable_log_stats: bool = True,
+    completed_path_ids: Collection[str] = (),
+    debug_events: DebugEventWriter | None = None,
+) -> Iterator[list[RolloutRecord]]:
     ensure_vllm_available()
     from vllm import LLM, SamplingParams
 
-    llm_kwargs: dict[str, Any] = {"model": model}
+    debug_events = debug_events or DebugEventWriter(None)
+
+    llm_kwargs: dict[str, Any] = {
+        "model": model,
+        "enforce_eager": enforce_eager,
+        "disable_log_stats": disable_log_stats,
+    }
     if gpu_memory_utilization is not None:
         llm_kwargs["gpu_memory_utilization"] = gpu_memory_utilization
     if max_num_batched_tokens is not None:
@@ -198,161 +351,138 @@ def run_vllm_rollouts(
         prompt_logprobs=proposal_logprobs_count,
     )
 
-    total_rollouts = len(problems) * rollout_budget
-    progress = make_progress(total_rollouts, "vLLM rollout")
-    debug_events = DebugEventWriter(debug_event_path)
     vllm_call_id = 0
-    try:
-        debug_events.open()
-        for request_chunk in iter_request_chunks(
-            problems,
-            rollout_budget,
-            tokenizer,
-            system_prompt,
-            user_template,
-            batch_size,
-        ):
-            vllm_call_id += 1
-            proposal_started = time.monotonic()
+    for request_chunk in iter_request_chunks(
+        problems,
+        rollout_budget,
+        tokenizer,
+        system_prompt,
+        user_template,
+        batch_size,
+        completed_path_ids,
+    ):
+        vllm_call_id += 1
+        proposal_started = time.monotonic()
+        debug_events.write(
+            "vllm_call_start",
+            vllm_call_id=vllm_call_id,
+            operation="sample_completion",
+            batch_size=len(request_chunk),
+            sampling={
+                "temperature": temperature,
+                "top_p": top_p,
+                "top_k": top_k,
+                "max_tokens": max_tokens,
+                "logprobs": proposal_logprobs_count,
+            },
+            items=[request_debug_item(request) for request in request_chunk],
+        )
+        try:
+            outputs = llm.generate(
+                [token_prompt(request.prompt_token_ids) for request in request_chunk],
+                proposal_params,
+                use_tqdm=False,
+            )
+        except Exception as exc:
             debug_events.write(
-                "vllm_call_start",
-                run_id=run_id,
+                "vllm_call_error",
                 vllm_call_id=vllm_call_id,
                 operation="sample_completion",
-                batch_size=len(request_chunk),
+                elapsed_s=round(time.monotonic() - proposal_started, 6),
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            raise
+        debug_events.write(
+            "vllm_call_end",
+            vllm_call_id=vllm_call_id,
+            operation="sample_completion",
+            elapsed_s=round(time.monotonic() - proposal_started, 6),
+            items=[
+                proposal_output_debug_item(request, output)
+                for request, output in zip(request_chunk, outputs, strict=True)
+            ],
+        )
+        generated = [
+            prepare_generated_rollout(request, output)
+            for request, output in zip(request_chunk, outputs, strict=True)
+        ]
+        proposal_errors = [item.error for item in generated if item.error is not None]
+        if proposal_errors and len(proposal_errors) == len(generated):
+            raise RuntimeError(
+                "vLLM proposal logprob extraction failed for every item in chunk: "
+                + "; ".join(proposal_errors[:3])
+            )
+        raw_ready = [item for item in generated if item.error is None]
+        if raw_ready:
+            vllm_call_id += 1
+            raw_started = time.monotonic()
+            debug_events.write(
+                "vllm_call_start",
+                vllm_call_id=vllm_call_id,
+                operation="score_completion_logprobs",
+                batch_size=len(raw_ready),
                 sampling={
-                    "temperature": temperature,
-                    "top_p": top_p,
-                    "top_k": top_k,
-                    "max_tokens": max_tokens,
-                    "logprobs": proposal_logprobs_count,
+                    "temperature": 0.0,
+                    "top_p": 1.0,
+                    "top_k": 0,
+                    "max_tokens": 1,
+                    "prompt_logprobs": proposal_logprobs_count,
                 },
-                items=[request_debug_item(request) for request in request_chunk],
+                items=[raw_prefill_debug_item(item) for item in raw_ready],
             )
             try:
-                outputs = llm.generate(
-                    [token_prompt(request.prompt_token_ids) for request in request_chunk],
-                    proposal_params,
-                    use_tqdm=False,
+                raw_results = batch_raw_prefill_logprobs(
+                    llm=llm,
+                    raw_params=raw_params,
+                    generated=raw_ready,
                 )
             except Exception as exc:
                 debug_events.write(
                     "vllm_call_error",
-                    run_id=run_id,
                     vllm_call_id=vllm_call_id,
-                    operation="sample_completion",
-                    elapsed_s=round(time.monotonic() - proposal_started, 6),
+                    operation="score_completion_logprobs",
+                    elapsed_s=round(time.monotonic() - raw_started, 6),
                     error_type=type(exc).__name__,
                     error=str(exc),
                 )
                 raise
             debug_events.write(
                 "vllm_call_end",
-                run_id=run_id,
                 vllm_call_id=vllm_call_id,
-                operation="sample_completion",
-                elapsed_s=round(time.monotonic() - proposal_started, 6),
+                operation="score_completion_logprobs",
+                elapsed_s=round(time.monotonic() - raw_started, 6),
                 items=[
-                    proposal_output_debug_item(request, output)
-                    for request, output in zip(request_chunk, outputs, strict=True)
+                    raw_result_debug_item(item, raw_result)
+                    for item, raw_result in zip(raw_ready, raw_results, strict=True)
                 ],
             )
-            generated = [
-                prepare_generated_rollout(request, output)
-                for request, output in zip(request_chunk, outputs, strict=True)
-            ]
-            proposal_errors = [item.error for item in generated if item.error is not None]
-            if proposal_errors and len(proposal_errors) == len(generated):
-                raise RuntimeError(
-                    "vLLM proposal logprob extraction failed for every item in chunk: "
-                    + "; ".join(proposal_errors[:3])
-                )
-            raw_ready = [item for item in generated if item.error is None]
-            if raw_ready:
-                vllm_call_id += 1
-                raw_started = time.monotonic()
-                debug_events.write(
-                    "vllm_call_start",
-                    run_id=run_id,
-                    vllm_call_id=vllm_call_id,
-                    operation="score_completion_logprobs",
-                    batch_size=len(raw_ready),
-                    sampling={
-                        "temperature": 0.0,
-                        "top_p": 1.0,
-                        "top_k": 0,
-                        "max_tokens": 1,
-                        "prompt_logprobs": proposal_logprobs_count,
-                    },
-                    items=[raw_prefill_debug_item(item) for item in raw_ready],
-                )
-                try:
-                    raw_results = batch_raw_prefill_logprobs(
-                        llm=llm,
-                        raw_params=raw_params,
-                        generated=raw_ready,
-                    )
-                except Exception as exc:
-                    debug_events.write(
-                        "vllm_call_error",
-                        run_id=run_id,
-                        vllm_call_id=vllm_call_id,
-                        operation="score_completion_logprobs",
-                        elapsed_s=round(time.monotonic() - raw_started, 6),
-                        error_type=type(exc).__name__,
-                        error=str(exc),
-                    )
-                    raise
-                debug_events.write(
-                    "vllm_call_end",
-                    run_id=run_id,
-                    vllm_call_id=vllm_call_id,
-                    operation="score_completion_logprobs",
-                    elapsed_s=round(time.monotonic() - raw_started, 6),
-                    items=[
-                        raw_result_debug_item(item, raw_result)
-                        for item, raw_result in zip(raw_ready, raw_results, strict=True)
-                    ],
-                )
-            else:
-                raw_results = []
-            raw_errors = [item for item in raw_results if isinstance(item, Exception)]
-            if raw_ready and len(raw_errors) == len(raw_results):
-                raise RuntimeError(
-                    "vLLM raw prefill logprob extraction failed for every valid item in chunk: "
-                    + "; ".join(str(error) for error in raw_errors[:3])
-                )
-            raw_results_by_path_id = {
-                item.path_id: raw_result
-                for item, raw_result in zip(
-                    raw_ready,
-                    raw_results,
-                    strict=True,
-                )
-            }
-            for item in generated:
-                record = build_vllm_record(
+        else:
+            raw_results = []
+        raw_errors = [item for item in raw_results if isinstance(item, Exception)]
+        if raw_ready and len(raw_errors) == len(raw_results):
+            raise RuntimeError(
+                "vLLM raw prefill logprob extraction failed for every valid item in chunk: "
+                + "; ".join(str(error) for error in raw_errors[:3])
+            )
+        raw_results_by_path_id = {
+            item.path_id: raw_result
+            for item, raw_result in zip(raw_ready, raw_results, strict=True)
+        }
+        records: list[RolloutRecord] = []
+        for item in generated:
+            records.append(
+                build_vllm_record(
                     run_id=run_id,
                     generated=item,
                     raw_result=raw_results_by_path_id.get(item.path_id),
                     proposal_distribution=proposal_distribution,
                     raw_logprob_source=raw_logprob_source,
                 )
-                debug_events.write(
-                    "record_yield",
-                    run_id=run_id,
-                    path_id=record.path_id,
-                    problem_id=record.problem_id,
-                    rollout_index=record.rollout_index,
-                    is_valid=record.is_valid,
-                    output_token_count=record.output_token_count,
-                    error=record.error,
-                )
-                yield record
-                progress.update(1)
-    finally:
-        debug_events.close()
-        progress.close()
+            )
+        for record in records:
+            write_record_ready_event(debug_events, record)
+        yield records
 
 
 def iter_request_chunks(
@@ -362,11 +492,15 @@ def iter_request_chunks(
     system_prompt: str,
     user_template: str,
     batch_size: int | None,
+    completed_path_ids: Collection[str] = (),
 ) -> Iterator[list[RolloutRequest]]:
     chunk_size = batch_size if batch_size and batch_size > 0 else rollout_budget
     chunk: list[RolloutRequest] = []
     for problem in problems:
         for rollout_index in range(rollout_budget):
+            path_id = f"{problem.problem_id}-{rollout_index:04d}"
+            if path_id in completed_path_ids:
+                continue
             chunk.append(
                 build_chat_rollout_request(
                     problem,
@@ -384,29 +518,40 @@ def iter_request_chunks(
 
 
 class NullProgress:
+    def __init__(self, total: int = 0, initial: int = 0) -> None:
+        self.total = total
+        self.n = initial
+
     def update(self, count: int) -> None:
-        pass
+        self.n += count
 
     def close(self) -> None:
         pass
 
 
-def make_progress(total: int, desc: str):
+def make_progress(total: int, desc: str, initial: int = 0):
     if tqdm is None:
-        return NullProgress()
-    return tqdm(total=total, desc=desc, dynamic_ncols=True)
+        return NullProgress(total=total, initial=initial)
+    return tqdm(total=total, initial=initial, desc=desc, dynamic_ncols=True)
 
 
 class DebugEventWriter:
-    def __init__(self, path: str | Path | None) -> None:
+    def __init__(
+        self,
+        path: str | Path | None,
+        run_id: str | None = None,
+        attempt_id: str | None = None,
+    ) -> None:
         self.path = Path(path) if path is not None else None
+        self.run_id = run_id
+        self.attempt_id = attempt_id
         self.handle = None
 
     def open(self) -> None:
         if self.path is None:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.handle = self.path.open("w", encoding="utf-8")
+        self.handle = self.path.open("a", encoding="utf-8")
 
     def close(self) -> None:
         if self.handle is None:
@@ -420,12 +565,31 @@ class DebugEventWriter:
         record = {
             "event_time": datetime.now().astimezone().isoformat(timespec="milliseconds"),
             "event": event,
-            **payload,
         }
+        if self.run_id is not None:
+            record["run_id"] = self.run_id
+        if self.attempt_id is not None:
+            record["attempt_id"] = self.attempt_id
+        record.update(payload)
         self.handle.write(json.dumps(record, ensure_ascii=False))
         self.handle.write("\n")
         self.handle.flush()
         os.fsync(self.handle.fileno())
+
+
+def write_record_ready_event(
+    debug_events: DebugEventWriter,
+    record: RolloutRecord,
+) -> None:
+    debug_events.write(
+        "record_ready",
+        path_id=record.path_id,
+        problem_id=record.problem_id,
+        rollout_index=record.rollout_index,
+        is_valid=record.is_valid,
+        output_token_count=record.output_token_count,
+        error=record.error,
+    )
 
 
 def request_path_id(request: RolloutRequest) -> str:
